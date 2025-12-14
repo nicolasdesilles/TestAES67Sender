@@ -30,7 +30,7 @@ void MainComponent::releaseResources()
 
 void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToFill)
 {
-    noise.process(*bufferToFill.buffer);
+    //noise.process(*bufferToFill.buffer);
 }
 
 } // namespace GuiApp

@@ -19,7 +19,7 @@ public:
 private:
     juce::AudioDeviceSelectorComponent selector {
         deviceManager, 2, 2, 2, 2, false, false, true, false};
-    WhiteNoise::Oscillator noise;
+    //WhiteNoise::Oscillator noise;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };
