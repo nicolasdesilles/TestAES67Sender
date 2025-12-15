@@ -6,6 +6,8 @@
 #include "ravennakit/core/util/wrapping_uint.hpp"
 #include "ravennakit/ptp/ptp_definitions.hpp"
 #include "ravennakit/ptp/types/ptp_clock_identity.hpp"
+#include "ravennakit/sdp/sdp_session_description.hpp"
+#include "ravennakit/sdp/detail/sdp_reference_clock.hpp"
 
 #include <thread>
 #include <cmath>
@@ -244,14 +246,26 @@ bool RavennaNodeManager::initialize()
 
 bool RavennaNodeManager::start(const std::string& sessionName)
 {
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:start:entry", "Start requested", "{\"session\":\"" + sessionName + "\"}");
+    // #endregion
+    
     if (!node_)
     {
+        DEBUG_LOG("RavennaNodeManager.cpp:start:no_node", "Node not initialized", "{}");
         return false;
     }
     
     if (isActive_)
     {
+        DEBUG_LOG("RavennaNodeManager.cpp:start:already_active", "Sender already active", "{}");
         return true; // Already started
+    }
+    
+    if (!ptpSubscriber_ || !ptpSubscriber_->isSynchronized())
+    {
+        DEBUG_LOG("RavennaNodeManager.cpp:start:ptp_not_synced", "PTP not synchronized, cannot start sender", "{}");
+        return false;
     }
     
     // Configure the sender
@@ -275,26 +289,32 @@ bool RavennaNodeManager::start(const std::string& sessionName)
     senderConfig.ttl = 15;
     
     // Set destination (multicast on port 5004, standard for AES67)
+    const auto dstAddress = boost::asio::ip::make_address_v4("239.69.69.69");
     senderConfig.destinations.emplace_back(
         rav::RavennaSender::Destination {
             rav::rank::primary,
-            {boost::asio::ip::address_v4::any(), 5004},
+            {dstAddress, 5004},
             true
         }
     );
     
     senderConfig.enabled = true;
     
+    DEBUG_LOG("RavennaNodeManager.cpp:start:create_sender_begin", "Creating sender", "{\"dst\":\"239.69.69.69:5004\",\"payloadType\":98}");
+    
     // Create the sender
     auto result = node_->create_sender(senderConfig).get();
     if (!result)
     {
+        DEBUG_LOG("RavennaNodeManager.cpp:start:create_sender_failed", "create_sender failed", "{\"error\":\"" + result.error() + "\"}");
         return false;
     }
     
     senderId_ = *result;
     isActive_ = true;
-    rtpTimestamp_ = 0;
+    rtpTimestamp_ = ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate);
+    
+    DEBUG_LOG("RavennaNodeManager.cpp:start:create_sender_ok", "Sender started", "{\"senderId\":\"" + senderId_.to_string() + "\",\"rtpTs\":" + std::to_string(rtpTimestamp_) + "}");
     
     return true;
 }
@@ -369,8 +389,19 @@ bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
     // Send audio data with PTP-synced RTP timestamp
     if (!node_->send_audio_data_realtime(senderId_, bufferView, rtpTimestamp_))
     {
+        audioSendErrors_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    
+    // Update statistics
+    audioPacketsSent_.fetch_add(1, std::memory_order_relaxed);
+    audioSamplesSent_.fetch_add(static_cast<uint64_t>(numSamples), std::memory_order_relaxed);
+    lastAudioSendTime_.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count(),
+        std::memory_order_relaxed
+    );
     
     // Increment RTP timestamp by number of samples sent
     rtpTimestamp_ += static_cast<uint32_t>(numSamples);
@@ -497,6 +528,104 @@ bool RavennaNodeManager::setPtpDomain(uint8_t domainNumber)
     
     auto result = node_->set_ptp_instance_configuration(ptpConfig).get();
     return result.has_value();
+}
+
+std::string RavennaNodeManager::getSenderDiagnostics() const
+{
+    std::stringstream diagnostics;
+    
+    if (!isActive())
+    {
+        diagnostics << "Sender: Not Active\n";
+        return diagnostics.str();
+    }
+    
+    diagnostics << "Sender: Active\n";
+    diagnostics << "Sender ID: " << senderId_.to_string() << "\n";
+    
+    // Get sender configuration via SDP
+    try
+    {
+        auto sdpFuture = node_->get_sdp_for_sender(senderId_);
+        auto sdpResult = sdpFuture.get();
+        
+        if (sdpResult)
+        {
+            const auto& sdp = *sdpResult;
+            diagnostics << "Session Name: " << sdp.session_name << "\n";
+            
+            if (!sdp.media_descriptions.empty())
+            {
+                const auto& media = sdp.media_descriptions[0];
+                diagnostics << "RTP Port: " << media.port << "\n";
+                diagnostics << "Payload Type: " << static_cast<int>(media.formats.empty() ? 0 : media.formats[0].payload_type) << "\n";
+                
+                if (sdp.connection_info)
+                {
+                    diagnostics << "Destination: " << sdp.connection_info->address << "\n";
+                }
+                
+                if (media.ptime)
+                {
+                    diagnostics << "Packet Time: " << *media.ptime << " ms\n";
+                }
+            }
+            
+            if (sdp.reference_clock)
+            {
+                diagnostics << "PTP Source: " << rav::sdp::to_string(sdp.reference_clock->source_) << "\n";
+                if (sdp.reference_clock->gmid_)
+                {
+                    diagnostics << "PTP Grandmaster ID: " << *sdp.reference_clock->gmid_ << "\n";
+                }
+                if (sdp.reference_clock->domain_)
+                {
+                    diagnostics << "PTP Domain: " << *sdp.reference_clock->domain_ << "\n";
+                }
+            }
+        }
+        else
+        {
+            diagnostics << "SDP Error: " << sdpResult.error() << "\n";
+        }
+    }
+    catch (const std::exception& e)
+    {
+        diagnostics << "SDP Exception: " << e.what() << "\n";
+    }
+    
+    // Audio statistics
+    const auto packetsSent = audioPacketsSent_.load(std::memory_order_relaxed);
+    const auto sendErrors = audioSendErrors_.load(std::memory_order_relaxed);
+    const auto samplesSent = audioSamplesSent_.load(std::memory_order_relaxed);
+    const auto lastSendTime = lastAudioSendTime_.load(std::memory_order_relaxed);
+    
+    diagnostics << "\nAudio Statistics:\n";
+    diagnostics << "Packets Sent: " << packetsSent << "\n";
+    diagnostics << "Send Errors: " << sendErrors << "\n";
+    diagnostics << "Samples Sent: " << samplesSent << "\n";
+    
+    if (lastSendTime > 0)
+    {
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        const auto timeSinceLastSend = static_cast<int64_t>(now) - static_cast<int64_t>(lastSendTime);
+        diagnostics << "Last Send: " << timeSinceLastSend << " ms ago\n";
+        
+        if (timeSinceLastSend > 1000)
+        {
+            diagnostics << "WARNING: No audio sent in last second!\n";
+        }
+    }
+    else
+    {
+        diagnostics << "Last Send: Never\n";
+    }
+    
+    diagnostics << "RTP Timestamp: " << rtpTimestamp_ << "\n";
+    
+    return diagnostics.str();
 }
 
 } // namespace AudioApp

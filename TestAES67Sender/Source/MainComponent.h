@@ -45,6 +45,8 @@ private:
     juce::TextEditor ptpDiagnosticsText_;
     juce::Label senderStatusLabel_;
     juce::Label senderStatusValue_;
+    juce::Label senderDiagnosticsLabel_;
+    juce::TextEditor senderDiagnosticsText_;
     juce::TextButton startStopButton_;
     
     // State

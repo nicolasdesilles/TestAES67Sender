@@ -97,6 +97,12 @@ public:
      * @return true if domain was set successfully
      */
     bool setPtpDomain(uint8_t domainNumber);
+    
+    /**
+     * Get sender diagnostic information as a string.
+     * @return String containing sender status, configuration, SDP, etc.
+     */
+    std::string getSenderDiagnostics() const;
 
 private:
     std::unique_ptr<rav::RavennaNode> node_;
@@ -176,6 +182,12 @@ private:
     
     // RTP timestamp tracking
     uint32_t rtpTimestamp_;
+    
+    // Audio send statistics
+    mutable std::atomic<uint64_t> audioPacketsSent_{0};
+    mutable std::atomic<uint64_t> audioSendErrors_{0};
+    mutable std::atomic<uint64_t> audioSamplesSent_{0};
+    mutable std::atomic<uint64_t> lastAudioSendTime_{0};
     
     // Audio format: 48kHz, 24-bit, mono
     static constexpr uint32_t kSampleRate = 48000;
