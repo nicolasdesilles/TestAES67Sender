@@ -2,13 +2,18 @@ project(TestAES67Sender VERSION 0.0.1)
 
 set (TargetName ${PROJECT_NAME})
 
+# Set C++17 standard (required by ravennakit)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 juce_add_gui_app(${TargetName} PRODUCT_NAME "TestAES67Sender")
 juce_generate_juce_header(${TargetName})
 
 target_sources(${TargetName} PRIVATE
         Source/Main.cpp
         Source/MainComponent.cpp
-        Source/MainWindow.cpp)
+        Source/MainWindow.cpp
+        Source/RavennaNodeManager.cpp)
 
 target_compile_definitions(${TargetName} PRIVATE
         JUCE_WEB_BROWSER=0
@@ -21,4 +26,5 @@ target_link_libraries(${TargetName} PRIVATE
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
         juce::juce_gui_basics
-        shared_processing_code)
+        shared_processing_code
+        ravennakit)
