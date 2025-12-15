@@ -1,0 +1,6 @@
+[submodule "external/ravennakit"]
+	path = external/ravennakit
+	url = https://github.com/soundondigital/ravennakit.git
+[submodule "external/vcpkg"]
+	path = external/vcpkg
+	url = https://github.com/Microsoft/vcpkg.git
