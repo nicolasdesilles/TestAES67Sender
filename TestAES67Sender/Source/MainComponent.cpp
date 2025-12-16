@@ -12,11 +12,9 @@ MainComponent::MainComponent()
     , ptpDiagnosticsText_()
     , senderStatusLabel_("Sender Status:", "Sender Status:")
     , senderStatusValue_("senderStatus", "Stopped")
-    , senderDiagnosticsLabel_("Sender Diagnostics:", "Sender Diagnostics:")
-    , senderDiagnosticsText_()
     , startStopButton_("Start Sending")
 {
-    setAudioChannels(2, 64); // 2 inputs, up to 64 outputs (for flexibility)
+    setAudioChannels(64, 64);
     
     // Setup network interface combo
     networkInterfaceLabel_.attachToComponent(&networkInterfaceCombo_, true);
@@ -45,13 +43,6 @@ MainComponent::MainComponent()
     senderStatusValue_.setColour(juce::Label::textColourId, juce::Colours::orange);
     addAndMakeVisible(senderStatusValue_);
     
-    // Setup sender diagnostics
-    senderDiagnosticsLabel_.attachToComponent(&senderDiagnosticsText_, true);
-    senderDiagnosticsText_.setMultiLine(true);
-    senderDiagnosticsText_.setReadOnly(true);
-    senderDiagnosticsText_.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 10.0f, 0));
-    addAndMakeVisible(senderDiagnosticsText_);
-    
     // Setup start/stop button
     startStopButton_.onClick = [this] { onStartStopClicked(); };
     addAndMakeVisible(startStopButton_);
@@ -69,7 +60,7 @@ MainComponent::MainComponent()
     // Start timer to update status displays
     startTimer(500); // Update every 500ms
     
-    setSize(800, 600);
+    setSize(900, 1000);
 }
 
 MainComponent::~MainComponent()
@@ -171,11 +162,6 @@ void MainComponent::resized()
     // Sender status
     auto senderBounds = bounds.removeFromTop(controlHeight);
     senderStatusValue_.setBounds(senderBounds.removeFromLeft(300).withTrimmedLeft(labelWidth));
-    bounds.removeFromTop(margin);
-    
-    // Sender diagnostics
-    auto senderDiagBounds = bounds.removeFromTop(150);
-    senderDiagnosticsText_.setBounds(senderDiagBounds.removeFromLeft(bounds.getWidth() - labelWidth).withTrimmedLeft(labelWidth));
     bounds.removeFromTop(margin);
     
     // Start/Stop button
@@ -329,6 +315,12 @@ void MainComponent::timerCallback()
 {
     updatePtpStatus();
     
+    // Check if PTP is stuck and needs retry (helps with "first launch after build" issue on macOS)
+    if (ravennaInitialized_)
+    {
+        ravennaManager_.checkAndRetryPtpIfStuck();
+    }
+    
     // Update sender status
     if (ravennaManager_.isActive())
     {
@@ -348,10 +340,6 @@ void MainComponent::timerCallback()
             startStopButton_.setButtonText("Start Sending");
         }
     }
-    
-    // Update sender diagnostics
-    auto diagnostics = ravennaManager_.getSenderDiagnostics();
-    senderDiagnosticsText_.setText(juce::String(diagnostics), juce::dontSendNotification);
 }
 
 } // namespace AudioApp

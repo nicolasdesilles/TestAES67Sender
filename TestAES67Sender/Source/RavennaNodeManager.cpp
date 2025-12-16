@@ -6,8 +6,9 @@
 #include "ravennakit/core/util/wrapping_uint.hpp"
 #include "ravennakit/ptp/ptp_definitions.hpp"
 #include "ravennakit/ptp/types/ptp_clock_identity.hpp"
-#include "ravennakit/sdp/sdp_session_description.hpp"
-#include "ravennakit/sdp/detail/sdp_reference_clock.hpp"
+
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
 #include <thread>
 #include <cmath>
@@ -30,15 +31,16 @@ namespace AudioApp
 
 // RavennaNodeManager implementation
 RavennaNodeManager::RavennaNodeManager()
-    : senderId_()
-    , isActive_(false)
+    : isActive_(false)
     , rtpTimestamp_(0)
 {
+    senderIds_.reserve(kMaxSenders);
+    senderEnabled_.resize(kMaxSenders, false);
 }
 
 RavennaNodeManager::~RavennaNodeManager()
 {
-    stop();
+    shutdown();
 }
 
 bool RavennaNodeManager::initialize()
@@ -192,53 +194,89 @@ bool RavennaNodeManager::initialize()
         }
     }
     
-    // Configure PTP domain (default is 0, which is standard for AES67)
-    // This must be done AFTER setting network interface so PTP ports exist
-    rav::ptp::Instance::Configuration ptpConfig;
-    ptpConfig.domain_number = 0; // AES67 standard domain
-    
-    // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:initialize:ptp_config_before", "Setting PTP configuration", "{\"domain\":0}");
-    // #endregion
-    
-    auto ptpResult = node_->set_ptp_instance_configuration(ptpConfig).get();
-    if (!ptpResult)
-    {
-        // Log error but continue
-        RAV_LOG_ERROR("Failed to set PTP configuration: {}", ptpResult.error());
-        // #region agent log
-        DEBUG_LOG("RavennaNodeManager.cpp:initialize:ptp_config_failed", "PTP configuration failed", "{\"error\":\"" + ptpResult.error() + "\"}");
-        // #endregion
-    }
-    else
-    {
-        // #region agent log
-        DEBUG_LOG("RavennaNodeManager.cpp:initialize:ptp_config_success", "PTP configuration set successfully", "{\"domain\":0}");
-        // #endregion
-    }
-    
-    // Create PTP subscriber (after network interface and PTP config are set)
+    // Create PTP subscriber (after network interface config is set)
+    // Note: We don't call set_ptp_instance_configuration() - the RavennaNode
+    // handles PTP setup automatically based on network interface config.
+    // This follows the pattern used in ravennakit examples.
     ptpSubscriber_ = std::make_unique<PtpSubscriber>();
     node_->subscribe_to_ptp_instance(ptpSubscriber_.get()).wait();
+    
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:initialize:ptp_config_success", "PTP subscriber created and subscribed", "{\"domain\":0}");
+    // #endregion
     
     // #region agent log
     DEBUG_LOG("RavennaNodeManager.cpp:initialize:ptp_subscriber_added", "PTP subscriber added", "{}");
     // #endregion
     
+    // Delay to allow macOS to set up multicast routing for newly-built binaries
+    // This helps with the "first launch after build" issue where PTP packets aren't received
+    // macOS performs security checks on new binaries which can delay multicast reception
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:initialize:multicast_settle_delay", "Waiting for multicast routing to settle (500ms)", "{}");
+    // #endregion
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    
+    // Record initialization time for PTP retry logic
+    ptpInitTime_ = std::chrono::steady_clock::now();
+    
     // Enable NMOS (IS-04 and IS-05 are enabled by default when NMOS is enabled)
     rav::nmos::Node::Configuration nmosConfig;
+    nmosConfig.id = boost::uuids::random_generator()();  // Required: generate a unique UUID for this node
     nmosConfig.enabled = true;
+    nmosConfig.api_port = 80;  // Standard HTTP port for NMOS testing (or use 5555 for non-privileged)
     nmosConfig.label = "TestAES67Sender";
     nmosConfig.description = "RAVENNA AES67 Sender";
+    
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_config", "NMOS configuration prepared", "{\"id\":\"" + boost::uuids::to_string(nmosConfig.id) + "\",\"port\":" + std::to_string(nmosConfig.api_port) + "}");
+    // #endregion
+    
     auto nmosResult = node_->set_nmos_configuration(nmosConfig).get();
     if (!nmosResult)
     {
-        // NMOS setup failed, but we can continue without it
-        // (it's optional for basic RAVENNA functionality)
+        // NMOS setup failed - try with a non-privileged port if port 80 failed
+        nmosConfig.api_port = 5555;
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_retry", "NMOS failed on port 80, retrying with port 5555", "{}");
+        // #endregion
+        nmosResult = node_->set_nmos_configuration(nmosConfig).get();
+        if (!nmosResult)
+        {
+            // #region agent log
+            std::string errorMsg = nmosResult.error();
+            std::string escapedError;
+            for (char c : errorMsg) {
+                if (c == '"') escapedError += "\\\"";
+                else if (c == '\\') escapedError += "\\\\";
+                else escapedError += c;
+            }
+            DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_failed", "NMOS configuration failed", "{\"error\":\"" + escapedError + "\"}");
+            // #endregion
+        }
+        else
+        {
+            nmosPort_ = nmosConfig.api_port;
+            // #region agent log
+            DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_success", "NMOS configuration succeeded", "{\"port\":" + std::to_string(nmosConfig.api_port) + "}");
+            // #endregion
+        }
+    }
+    else
+    {
+        nmosPort_ = nmosConfig.api_port;
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_success", "NMOS configuration succeeded", "{\"port\":" + std::to_string(nmosConfig.api_port) + "}");
+        // #endregion
     }
     
+    // Create all 64 senders (disabled) so they're registered with NMOS
+    // This allows NMOS testing tools to discover our sender capabilities
+    // Senders will be enabled individually when streaming starts
+    createAllSenders();
+    
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:initialize:exit", "Initialization complete", "{\"interface\":\"" + currentInterface_ + "\"}");
+    DEBUG_LOG("RavennaNodeManager.cpp:initialize:exit", "Initialization complete", "{\"interface\":\"" + currentInterface_ + "\",\"sendersCreated\":" + std::to_string(senderIds_.size()) + "}");
     // #endregion
     
     return true;
@@ -247,98 +285,170 @@ bool RavennaNodeManager::initialize()
 bool RavennaNodeManager::start(const std::string& sessionName)
 {
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:start:entry", "Start requested", "{\"session\":\"" + sessionName + "\"}");
+    DEBUG_LOG("RavennaNodeManager.cpp:start:entry", "start() called", "{\"sessionName\":\"" + sessionName + "\",\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
     // #endregion
     
     if (!node_)
     {
-        DEBUG_LOG("RavennaNodeManager.cpp:start:no_node", "Node not initialized", "{}");
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:start:no_node", "node_ is null - cannot start", "{}");
+        // #endregion
         return false;
     }
     
     if (isActive_)
     {
-        DEBUG_LOG("RavennaNodeManager.cpp:start:already_active", "Sender already active", "{}");
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:start:already_active", "Already active - returning true", "{}");
+        // #endregion
         return true; // Already started
     }
     
-    if (!ptpSubscriber_ || !ptpSubscriber_->isSynchronized())
+    // Enable the first sender (index 0)
+    const size_t senderIndex = 0;
+    
+    if (senderIndex >= senderIds_.size() || !senderIds_[senderIndex].is_valid())
     {
-        DEBUG_LOG("RavennaNodeManager.cpp:start:ptp_not_synced", "PTP not synchronized, cannot start sender", "{}");
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:start:no_sender", "Sender 0 not available", "{\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
+        // #endregion
         return false;
     }
     
-    // Configure the sender
-    rav::RavennaSender::Configuration senderConfig;
+    // Create enabled configuration for sender 0
+    auto senderConfig = createSenderConfig(senderIndex, true);
     senderConfig.session_name = sessionName;
     
-    // Set audio format: 48kHz, 24-bit, mono
-    senderConfig.audio_format.encoding = kEncoding;
-    senderConfig.audio_format.sample_rate = kSampleRate;
-    senderConfig.audio_format.num_channels = kNumChannels;
-    senderConfig.audio_format.byte_order = rav::AudioFormat::ByteOrder::be; // Big endian for network
-    senderConfig.audio_format.ordering = rav::AudioFormat::ChannelOrdering::interleaved;
+    // #region agent log
+    {
+        std::stringstream configData;
+        configData << "{\"senderIndex\":" << senderIndex 
+                   << ",\"sessionName\":\"" << sessionName 
+                   << "\",\"destAddress\":\"" << senderConfig.destinations[0].endpoint.address().to_string() << "\""
+                   << ",\"destPort\":" << senderConfig.destinations[0].endpoint.port()
+                   << ",\"enabled\":" << (senderConfig.enabled ? "true" : "false") << "}";
+        DEBUG_LOG("RavennaNodeManager.cpp:start:config", "Enabling sender 0", configData.str());
+    }
+    // #endregion
     
-    // Set packet time (1ms is standard for AES67)
-    senderConfig.packet_time = rav::aes67::PacketTime::ms_1();
-    
-    // Set payload type (dynamic range 96-127, 98 is commonly used)
-    senderConfig.payload_type = 98;
-    
-    // Set TTL for multicast
-    senderConfig.ttl = 15;
-    
-    // Set destination (multicast on port 5004, standard for AES67)
-    const auto dstAddress = boost::asio::ip::make_address_v4("239.69.69.69");
-    senderConfig.destinations.emplace_back(
-        rav::RavennaSender::Destination {
-            rav::rank::primary,
-            {dstAddress, 5004},
-            true
-        }
-    );
-    
-    senderConfig.enabled = true;
-    
-    DEBUG_LOG("RavennaNodeManager.cpp:start:create_sender_begin", "Creating sender", "{\"dst\":\"239.69.69.69:5004\",\"payloadType\":98}");
-    
-    // Create the sender
-    auto result = node_->create_sender(senderConfig).get();
+    // Update the sender configuration to enable it
+    auto result = node_->update_sender_configuration(senderIds_[senderIndex], senderConfig).get();
     if (!result)
     {
-        DEBUG_LOG("RavennaNodeManager.cpp:start:create_sender_failed", "create_sender failed", "{\"error\":\"" + result.error() + "\"}");
+        // #region agent log
+        std::string errorMsg = result.error();
+        std::string escapedError;
+        for (char c : errorMsg) {
+            if (c == '"') escapedError += "\\\"";
+            else if (c == '\\') escapedError += "\\\\";
+            else if (c == '\n') escapedError += "\\n";
+            else escapedError += c;
+        }
+        DEBUG_LOG("RavennaNodeManager.cpp:start:update_failed", "update_sender_configuration() failed", "{\"error\":\"" + escapedError + "\"}");
+        // #endregion
         return false;
     }
     
-    senderId_ = *result;
+    senderEnabled_[senderIndex] = true;
     isActive_ = true;
-    rtpTimestamp_ = ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate);
+    rtpTimestamp_ = 0;
     
-    DEBUG_LOG("RavennaNodeManager.cpp:start:create_sender_ok", "Sender started", "{\"senderId\":\"" + senderId_.to_string() + "\",\"rtpTs\":" + std::to_string(rtpTimestamp_) + "}");
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:start:success", "Sender 0 enabled successfully", "{\"senderId\":\"" + senderIds_[senderIndex].to_string() + "\"}");
+    // #endregion
     
     return true;
 }
 
 void RavennaNodeManager::stop()
 {
-    if (!node_ || !isActive_)
+    if (!node_)
     {
         return;
     }
     
-    // Remove the sender
-    if (senderId_.is_valid())
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:stop:entry", "Stopping RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
+    // #endregion
+    
+    // Disable all enabled senders (but keep them registered with NMOS for discovery)
+    for (size_t i = 0; i < senderIds_.size(); ++i)
     {
-        node_->remove_sender(senderId_).wait();
-        senderId_ = rav::Id();
+        if (senderIds_[i].is_valid() && senderEnabled_[i])
+        {
+            auto disabledConfig = createSenderConfig(i, false);
+            node_->update_sender_configuration(senderIds_[i], disabledConfig).wait();
+            senderEnabled_[i] = false;
+            
+            // #region agent log
+            DEBUG_LOG("RavennaNodeManager.cpp:stop:sender_disabled", "Sender disabled", "{\"senderIndex\":" + std::to_string(i) + "}");
+            // #endregion
+        }
     }
+    
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:stop:complete", "Streaming stopped (NMOS resources still registered)", "{}");
+    // #endregion
+    
+    isActive_ = false;
+}
+
+void RavennaNodeManager::shutdown()
+{
+    if (!node_)
+    {
+        return;
+    }
+    
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:shutdown:entry", "Shutting down RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
+    // #endregion
+    
+    // Remove all senders completely on shutdown
+    for (size_t i = 0; i < senderIds_.size(); ++i)
+    {
+        if (senderIds_[i].is_valid())
+        {
+            node_->remove_sender(senderIds_[i]).wait();
+            // #region agent log
+            DEBUG_LOG("RavennaNodeManager.cpp:shutdown:sender_removed", "Sender removed", "{\"senderIndex\":" + std::to_string(i) + "}");
+            // #endregion
+        }
+    }
+    senderIds_.clear();
+    senderEnabled_.clear();
+    
+    // Unsubscribe from PTP instance to properly release multicast group memberships
+    if (ptpSubscriber_)
+    {
+        node_->unsubscribe_from_ptp_instance(ptpSubscriber_.get()).wait();
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:shutdown:ptp_unsubscribed", "PTP subscriber unsubscribed", "{}");
+        // #endregion
+    }
+    
+    // Reset the node to trigger proper cleanup of sockets and multicast memberships
+    node_.reset();
+    
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:shutdown:complete", "RAVENNA node manager fully shut down", "{}");
+    // #endregion
     
     isActive_ = false;
 }
 
 bool RavennaNodeManager::isActive() const
 {
-    return isActive_ && senderId_.is_valid();
+    return isActive_ && !senderIds_.empty() && senderIds_[0].is_valid();
+}
+
+bool RavennaNodeManager::isSenderEnabled(size_t senderIndex) const
+{
+    if (senderIndex >= senderEnabled_.size())
+    {
+        return false;
+    }
+    return senderEnabled_[senderIndex];
 }
 
 bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
@@ -386,22 +496,16 @@ bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
     const float* channels[] = { audioData };
     rav::AudioBufferView<const float> bufferView(channels, kNumChannels, static_cast<size_t>(numSamples));
     
-    // Send audio data with PTP-synced RTP timestamp
-    if (!node_->send_audio_data_realtime(senderId_, bufferView, rtpTimestamp_))
+    // Send audio data with PTP-synced RTP timestamp (to sender 0)
+    if (senderIds_.empty() || !senderIds_[0].is_valid())
     {
-        audioSendErrors_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     
-    // Update statistics
-    audioPacketsSent_.fetch_add(1, std::memory_order_relaxed);
-    audioSamplesSent_.fetch_add(static_cast<uint64_t>(numSamples), std::memory_order_relaxed);
-    lastAudioSendTime_.store(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count(),
-        std::memory_order_relaxed
-    );
+    if (!node_->send_audio_data_realtime(senderIds_[0], bufferView, rtpTimestamp_))
+    {
+        return false;
+    }
     
     // Increment RTP timestamp by number of samples sent
     rtpTimestamp_ += static_cast<uint32_t>(numSamples);
@@ -496,11 +600,23 @@ std::string RavennaNodeManager::getPtpDiagnostics() const
     if (hasParent)
     {
         const auto& parent = ptpSubscriber_->getParent();
-        diagnostics += "Has Grandmaster: Yes\n";
-        diagnostics += "Grandmaster ID: " + parent.grandmaster_identity.to_string() + "\n";
-        diagnostics += "Parent Port ID: " + parent.parent_port_identity.clock_identity.to_string() + "\n";
-        diagnostics += "GM Priority1: " + std::to_string(parent.grandmaster_priority1) + "\n";
-        diagnostics += "GM Priority2: " + std::to_string(parent.grandmaster_priority2) + "\n";
+        const std::string gmId = parent.grandmaster_identity.to_string();
+        // Check if grandmaster ID is valid (not all zeros)
+        const bool hasValidGM = (gmId != "00-00-00-00-00-00-00-00");
+        
+        if (hasValidGM)
+        {
+            diagnostics += "Has Grandmaster: Yes\n";
+            diagnostics += "Grandmaster ID: " + gmId + "\n";
+            diagnostics += "Parent Port ID: " + parent.parent_port_identity.clock_identity.to_string() + "\n";
+            diagnostics += "GM Priority1: " + std::to_string(parent.grandmaster_priority1) + "\n";
+            diagnostics += "GM Priority2: " + std::to_string(parent.grandmaster_priority2) + "\n";
+        }
+        else
+        {
+            diagnostics += "Has Grandmaster: No (searching...)\n";
+            diagnostics += "Grandmaster ID: None (waiting for PTP announce)\n";
+        }
     }
     else
     {
@@ -530,102 +646,169 @@ bool RavennaNodeManager::setPtpDomain(uint8_t domainNumber)
     return result.has_value();
 }
 
-std::string RavennaNodeManager::getSenderDiagnostics() const
+bool RavennaNodeManager::checkAndRetryPtpIfStuck()
 {
-    std::stringstream diagnostics;
-    
-    if (!isActive())
+    // Stop if we've exhausted retries
+    if (!node_ || !ptpSubscriber_ || ptpRetryCount_ >= 3)
     {
-        diagnostics << "Sender: Not Active\n";
-        return diagnostics.str();
+        return false;
     }
     
-    diagnostics << "Sender: Active\n";
-    diagnostics << "Sender ID: " << senderId_.to_string() << "\n";
-    
-    // Get sender configuration via SDP
-    try
+    // Check if we've been waiting long enough (10 seconds since init)
+    const auto elapsed = std::chrono::steady_clock::now() - ptpInitTime_;
+    if (elapsed < std::chrono::seconds(10))
     {
-        auto sdpFuture = node_->get_sdp_for_sender(senderId_);
-        auto sdpResult = sdpFuture.get();
+        return false; // Not enough time has passed
+    }
+    
+    // Check if PTP is stuck in listening state (no grandmaster detected)
+    const auto state = ptpSubscriber_->getPortState();
+    const bool hasValidGrandmaster = ptpSubscriber_->hasParent() && 
+        ptpSubscriber_->getParent().grandmaster_identity.to_string() != "00-00-00-00-00-00-00-00";
+    
+    if (state == rav::ptp::State::listening && !hasValidGrandmaster)
+    {
+        ptpRetryCount_++;
         
-        if (sdpResult)
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:checkAndRetryPtpIfStuck", "PTP stuck in listening state, attempting simple retry", "{\"state\":\"listening\",\"hasValidGrandmaster\":false,\"retryCount\":" + std::to_string(ptpRetryCount_) + "}");
+        // #endregion
+        
+        // Simple approach: Just unsubscribe and re-subscribe
+        // Don't call set_ptp_instance_configuration() as it may corrupt PTP state
+        node_->unsubscribe_from_ptp_instance(ptpSubscriber_.get()).wait();
+        
+        // Wait a bit for cleanup
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        
+        // Re-subscribe
+        node_->subscribe_to_ptp_instance(ptpSubscriber_.get()).wait();
+        
+        // Reset the init time to give it another 10 seconds
+        ptpInitTime_ = std::chrono::steady_clock::now();
+        
+        // #region agent log
+        DEBUG_LOG("RavennaNodeManager.cpp:checkAndRetryPtpIfStuck:complete", "PTP simple retry completed", "{\"retryCount\":" + std::to_string(ptpRetryCount_) + "}");
+        // #endregion
+        
+        return true;
+    }
+    
+    return false;
+}
+
+boost::asio::ip::address_v4 RavennaNodeManager::generateMulticastAddress(size_t senderIndex)
+{
+    rav::NetworkInterfaceConfig netConfigForMulticast;
+    netConfigForMulticast.set_interface(rav::rank::primary, currentInterface_);
+    auto interfaceAddrs = netConfigForMulticast.get_interface_ipv4_addresses();
+    
+    if (!interfaceAddrs.empty()) {
+        auto ifaceBytes = interfaceAddrs[0].to_bytes();
+        // Generate unique multicast address for each sender in 239.x.y.z range
+        // Use senderIndex to create unique addresses: 239.{octet3}.{octet4}.{1+senderIndex}
+        // This gives us up to 254 unique addresses per interface (1-254)
+        uint8_t lastOctet = static_cast<uint8_t>(1 + (senderIndex % 254));
+        return boost::asio::ip::address_v4({239, ifaceBytes[2], ifaceBytes[3], lastOctet});
+    }
+    // Fallback to a standard AES67 multicast address range
+    uint8_t lastOctet = static_cast<uint8_t>(1 + (senderIndex % 254));
+    return boost::asio::ip::address_v4({239, 69, 1, lastOctet});
+}
+
+rav::RavennaSender::Configuration RavennaNodeManager::createSenderConfig(size_t senderIndex, bool enabled)
+{
+    rav::RavennaSender::Configuration config;
+    config.session_name = "TestAES67Sender_Ch" + std::to_string(senderIndex + 1);
+    
+    // Set audio format: 48kHz, 24-bit, mono
+    config.audio_format.encoding = kEncoding;
+    config.audio_format.sample_rate = kSampleRate;
+    config.audio_format.num_channels = kNumChannels;
+    config.audio_format.byte_order = rav::AudioFormat::ByteOrder::be;
+    config.audio_format.ordering = rav::AudioFormat::ChannelOrdering::interleaved;
+    
+    // Set packet time (1ms is standard for AES67)
+    config.packet_time = rav::aes67::PacketTime::ms_1();
+    
+    // Set payload type (dynamic range 96-127)
+    // Each sender gets a unique payload type: 98, 99, 100, ... (wrapping at 127 back to 96)
+    config.payload_type = static_cast<uint8_t>(98 + (senderIndex % 30));
+    
+    // Set TTL for multicast
+    config.ttl = 15;
+    
+    // Set destination multicast address (unique for each sender)
+    auto multicastAddr = generateMulticastAddress(senderIndex);
+    config.destinations.emplace_back(
+        rav::RavennaSender::Destination {
+            rav::rank::primary,
+            {multicastAddr, static_cast<uint16_t>(5004 + senderIndex)}, // Unique port per sender
+            true
+        }
+    );
+    
+    config.enabled = enabled;
+    
+    return config;
+}
+
+void RavennaNodeManager::createAllSenders()
+{
+    if (!node_)
+    {
+        return;
+    }
+    
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:createAllSenders:entry", "Creating all senders for NMOS registration", "{\"count\":" + std::to_string(kMaxSenders) + "}");
+    // #endregion
+    
+    senderIds_.clear();
+    senderIds_.reserve(kMaxSenders);
+    
+    size_t successCount = 0;
+    size_t failCount = 0;
+    
+    for (size_t i = 0; i < kMaxSenders; ++i)
+    {
+        // Create disabled sender configuration
+        auto senderConfig = createSenderConfig(i, false);
+        
+        // Create the sender
+        auto result = node_->create_sender(senderConfig).get();
+        if (result)
         {
-            const auto& sdp = *sdpResult;
-            diagnostics << "Session Name: " << sdp.session_name << "\n";
-            
-            if (!sdp.media_descriptions.empty())
-            {
-                const auto& media = sdp.media_descriptions[0];
-                diagnostics << "RTP Port: " << media.port << "\n";
-                diagnostics << "Payload Type: " << static_cast<int>(media.formats.empty() ? 0 : media.formats[0].payload_type) << "\n";
-                
-                if (sdp.connection_info)
-                {
-                    diagnostics << "Destination: " << sdp.connection_info->address << "\n";
-                }
-                
-                if (media.ptime)
-                {
-                    diagnostics << "Packet Time: " << *media.ptime << " ms\n";
-                }
-            }
-            
-            if (sdp.reference_clock)
-            {
-                diagnostics << "PTP Source: " << rav::sdp::to_string(sdp.reference_clock->source_) << "\n";
-                if (sdp.reference_clock->gmid_)
-                {
-                    diagnostics << "PTP Grandmaster ID: " << *sdp.reference_clock->gmid_ << "\n";
-                }
-                if (sdp.reference_clock->domain_)
-                {
-                    diagnostics << "PTP Domain: " << *sdp.reference_clock->domain_ << "\n";
-                }
-            }
+            senderIds_.push_back(*result);
+            senderEnabled_[i] = false;
+            successCount++;
         }
         else
         {
-            diagnostics << "SDP Error: " << sdpResult.error() << "\n";
+            // Push invalid ID to maintain index alignment
+            senderIds_.push_back(rav::Id());
+            failCount++;
+            
+            // Log first failure in detail
+            if (failCount == 1)
+            {
+                // #region agent log
+                std::string errorMsg = result.error();
+                std::string escapedError;
+                for (char c : errorMsg) {
+                    if (c == '"') escapedError += "\\\"";
+                    else if (c == '\\') escapedError += "\\\\";
+                    else escapedError += c;
+                }
+                DEBUG_LOG("RavennaNodeManager.cpp:createAllSenders:first_failure", "First sender creation failed", "{\"senderIndex\":" + std::to_string(i) + ",\"error\":\"" + escapedError + "\"}");
+                // #endregion
+            }
         }
     }
-    catch (const std::exception& e)
-    {
-        diagnostics << "SDP Exception: " << e.what() << "\n";
-    }
     
-    // Audio statistics
-    const auto packetsSent = audioPacketsSent_.load(std::memory_order_relaxed);
-    const auto sendErrors = audioSendErrors_.load(std::memory_order_relaxed);
-    const auto samplesSent = audioSamplesSent_.load(std::memory_order_relaxed);
-    const auto lastSendTime = lastAudioSendTime_.load(std::memory_order_relaxed);
-    
-    diagnostics << "\nAudio Statistics:\n";
-    diagnostics << "Packets Sent: " << packetsSent << "\n";
-    diagnostics << "Send Errors: " << sendErrors << "\n";
-    diagnostics << "Samples Sent: " << samplesSent << "\n";
-    
-    if (lastSendTime > 0)
-    {
-        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count();
-        const auto timeSinceLastSend = static_cast<int64_t>(now) - static_cast<int64_t>(lastSendTime);
-        diagnostics << "Last Send: " << timeSinceLastSend << " ms ago\n";
-        
-        if (timeSinceLastSend > 1000)
-        {
-            diagnostics << "WARNING: No audio sent in last second!\n";
-        }
-    }
-    else
-    {
-        diagnostics << "Last Send: Never\n";
-    }
-    
-    diagnostics << "RTP Timestamp: " << rtpTimestamp_ << "\n";
-    
-    return diagnostics.str();
+    // #region agent log
+    DEBUG_LOG("RavennaNodeManager.cpp:createAllSenders:complete", "Sender creation complete", "{\"success\":" + std::to_string(successCount) + ",\"failed\":" + std::to_string(failCount) + "}");
+    // #endregion
 }
 
 } // namespace AudioApp

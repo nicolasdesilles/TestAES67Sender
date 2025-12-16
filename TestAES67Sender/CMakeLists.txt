@@ -28,3 +28,12 @@ target_link_libraries(${TargetName} PRIVATE
         juce::juce_gui_basics
         shared_processing_code
         ravennakit)
+
+# macOS: Simple ad-hoc code signing (no sandbox entitlements)
+# This helps with macOS code signature requirements
+if (APPLE)
+    add_custom_command(TARGET ${TargetName} POST_BUILD
+        COMMAND codesign --force --deep --sign - "$<TARGET_BUNDLE_DIR:${TargetName}>"
+        COMMENT "Ad-hoc code signing ${TargetName}.app..."
+    )
+endif()

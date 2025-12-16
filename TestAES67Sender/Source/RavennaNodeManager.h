@@ -42,9 +42,16 @@ public:
     bool start(const std::string& sessionName = "TestAES67Sender");
 
     /**
-     * Stop the RAVENNA node and clean up resources.
+     * Stop sending audio (disables the sender but keeps NMOS registration).
+     * The sender can be restarted with start().
      */
     void stop();
+    
+    /**
+     * Fully shutdown the RAVENNA node manager (called on app exit).
+     * This removes all resources and releases network resources.
+     */
+    void shutdown();
 
     /**
      * Check if the node is currently active (started and sender created).
@@ -99,15 +106,40 @@ public:
     bool setPtpDomain(uint8_t domainNumber);
     
     /**
-     * Get sender diagnostic information as a string.
-     * @return String containing sender status, configuration, SDP, etc.
+     * Get the NMOS API port number.
+     * @return The port number the NMOS HTTP server is listening on, or 0 if not running
      */
-    std::string getSenderDiagnostics() const;
+    uint16_t getNmosPort() const { return nmosPort_; }
+    
+    /**
+     * Check if PTP is stuck and needs retry.
+     * Call this periodically (e.g., from a timer) to auto-recover from
+     * the "first launch after build" issue on macOS.
+     * @return true if a retry was attempted
+     */
+    bool checkAndRetryPtpIfStuck();
+
+    /**
+     * Get the number of pre-created senders.
+     * @return Number of senders (currently 64)
+     */
+    size_t getNumSenders() const { return senderIds_.size(); }
+    
+    /**
+     * Check if a specific sender is enabled.
+     * @param senderIndex Index of the sender (0-63)
+     * @return true if the sender is enabled
+     */
+    bool isSenderEnabled(size_t senderIndex) const;
 
 private:
+    // Maximum number of senders (one per JUCE output channel)
+    static constexpr size_t kMaxSenders = 64;
+    
     std::unique_ptr<rav::RavennaNode> node_;
-    rav::Id senderId_;
-    std::atomic<bool> isActive_;
+    std::vector<rav::Id> senderIds_;  // Array of 64 sender IDs
+    std::vector<bool> senderEnabled_; // Track which senders are enabled
+    std::atomic<bool> isActive_;      // True if at least one sender is active
     std::string currentInterface_;
     
     // PTP subscriber to monitor synchronization
@@ -183,16 +215,22 @@ private:
     // RTP timestamp tracking
     uint32_t rtpTimestamp_;
     
-    // Audio send statistics
-    mutable std::atomic<uint64_t> audioPacketsSent_{0};
-    mutable std::atomic<uint64_t> audioSendErrors_{0};
-    mutable std::atomic<uint64_t> audioSamplesSent_{0};
-    mutable std::atomic<uint64_t> lastAudioSendTime_{0};
+    // NMOS port
+    uint16_t nmosPort_{0};
+    
+    // PTP retry logic
+    std::chrono::steady_clock::time_point ptpInitTime_;
+    int ptpRetryCount_{0};
     
     // Audio format: 48kHz, 24-bit, mono
     static constexpr uint32_t kSampleRate = 48000;
     static constexpr rav::AudioEncoding kEncoding = rav::AudioEncoding::pcm_s24;
     static constexpr uint32_t kNumChannels = 1; // Mono
+    
+    // Helper methods
+    void createAllSenders();
+    boost::asio::ip::address_v4 generateMulticastAddress(size_t senderIndex);
+    rav::RavennaSender::Configuration createSenderConfig(size_t senderIndex, bool enabled);
 };
 
 } // namespace AudioApp
