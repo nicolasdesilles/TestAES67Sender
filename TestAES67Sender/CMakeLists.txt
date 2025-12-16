@@ -32,6 +32,13 @@ target_link_libraries(${TargetName} PRIVATE
 # macOS: Simple ad-hoc code signing (no sandbox entitlements)
 # This helps with macOS code signature requirements
 if (APPLE)
+    # Ensure microphone permission prompt is present so CoreAudio delivers input.
+    # We do this BEFORE codesigning, otherwise the plist edit invalidates the signature.
+    add_custom_command(TARGET ${TargetName} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -DPLIST_PATH="$<TARGET_BUNDLE_DIR:${TargetName}>/Contents/Info.plist" -P "${CMAKE_CURRENT_LIST_DIR}/cmake/set_mic_permission.cmake"
+        COMMENT "Setting NSMicrophoneUsageDescription in Info.plist"
+    )
+
     add_custom_command(TARGET ${TargetName} POST_BUILD
         COMMAND codesign --force --deep --sign - "$<TARGET_BUNDLE_DIR:${TargetName}>"
         COMMENT "Ad-hoc code signing ${TargetName}.app..."

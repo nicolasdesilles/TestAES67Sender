@@ -1,5 +1,10 @@
 #include "MainComponent.h"
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <cmath>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
 
 namespace AudioApp
 {
@@ -16,6 +21,9 @@ MainComponent::MainComponent()
 {
     setAudioChannels(64, 64);
     
+    inputMonitor_ = std::make_unique<InputMonitor>(*this);
+    deviceManager.addAudioCallback(inputMonitor_.get());
+    
     // Setup network interface combo
     networkInterfaceLabel_.attachToComponent(&networkInterfaceCombo_, true);
     networkInterfaceCombo_.onChange = [this] { onNetworkInterfaceChanged(); };
@@ -25,6 +33,16 @@ MainComponent::MainComponent()
     inputChannelLabel_.attachToComponent(&inputChannelCombo_, true);
     inputChannelCombo_.onChange = [this] { onInputChannelChanged(); };
     addAndMakeVisible(inputChannelCombo_);
+    
+    // Setup input level meter
+    inputLevelMeter_.startTimer(50); // Update peak decay every 50ms
+    addAndMakeVisible(inputLevelMeter_);
+    
+    inputLevelValueLabel_.setText("-inf dB", juce::dontSendNotification);
+    inputLevelValueLabel_.setJustificationType(juce::Justification::centredLeft);
+    inputLevelValueLabel_.setColour(juce::Label::textColourId, juce::Colours::white);
+    inputLevelValueLabel_.setFont(juce::Font(14.0f, juce::Font::plain));
+    addAndMakeVisible(inputLevelValueLabel_);
     
     // Setup PTP status
     ptpStatusLabel_.attachToComponent(&ptpStatusValue_, true);
@@ -66,6 +84,10 @@ MainComponent::MainComponent()
 MainComponent::~MainComponent()
 {
     stopTimer();
+    if (inputMonitor_ != nullptr)
+    {
+        deviceManager.removeAudioCallback(inputMonitor_.get());
+    }
     if (ravennaInitialized_)
     {
         ravennaManager_.stop();
@@ -75,6 +97,18 @@ MainComponent::~MainComponent()
 void MainComponent::prepareToPlay(int /*samplesPerBlockExpected*/, double sampleRate)
 {
     currentSampleRate_ = sampleRate;
+    
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto* device = deviceManager.getCurrentAudioDevice();
+            juce::BigInteger activeInputs = device ? device->getActiveInputChannels() : juce::BigInteger();
+            int numActiveInputs = activeInputs.countNumberOfSetBits();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H5\",\"location\":\"MainComponent.cpp:80\",\"message\":\"prepareToPlay called\",\"data\":{\"sampleRate\":" << sampleRate << ",\"deviceName\":\"" << (device ? device->getName().toStdString() : "null") << "\",\"numActiveInputChannels\":" << numActiveInputs << ",\"activeInputChannels\":\"" << activeInputs.toString(2).toStdString() << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        }
+    }
+    // #endregion
     
     // Check if sample rate matches 48kHz (required for RAVENNA)
     if (std::abs(sampleRate - 48000.0) > 1.0)
@@ -105,21 +139,163 @@ void MainComponent::releaseResources()
 
 void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToFill)
 {
-    auto* inputBuffer = bufferToFill.buffer;
-    
-    // Send to RAVENNA if active and we have a valid input channel
-    if (ravennaInitialized_ && ravennaManager_.isActive() && inputBuffer != nullptr)
+    bufferToFill.clearActiveBufferRegion();
+}
+
+void MainComponent::handleIncomingAudio(const float* const* inputChannelData, int numInputChannels, int numSamples)
+{
+    if (inputChannelData == nullptr || numInputChannels <= 0 || numSamples <= 0)
     {
-        const int numInputChannels = inputBuffer->getNumChannels();
-        if (selectedInputChannel_ >= 0 && selectedInputChannel_ < numInputChannels)
+        currentInputLevel_.store(0.0f);
+        currentInputLevelDb_.store(-100.0f);
+        return;
+    }
+
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (device == nullptr)
+    {
+        currentInputLevel_.store(0.0f);
+        currentInputLevelDb_.store(-100.0f);
+        return;
+    }
+
+    juce::BigInteger activeInputChannels = device->getActiveInputChannels();
+
+    int actualChannelIndex = -1;
+    int activeChannelCount = 0;
+    for (int channel = 0; channel < numInputChannels; ++channel)
+    {
+        if (activeInputChannels[channel])
         {
-            const float* channelData = inputBuffer->getReadPointer(selectedInputChannel_);
-            const int numSamples = bufferToFill.numSamples;
-            
-            ravennaManager_.sendAudio(channelData, numSamples);
+            if (activeChannelCount == selectedInputChannel_)
+            {
+                actualChannelIndex = channel;
+                break;
+            }
+            ++activeChannelCount;
         }
     }
+
+    static int logCounter = 0;
+    ++logCounter;
+    if (logCounter % 100 == 0)
+    {
+        std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open())
+        {
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H6\",\"location\":\"MainComponent.cpp:155\",\"message\":\"Active input channels check\",\"data\":{\"numActiveInputs\":" << activeInputChannels.countNumberOfSetBits() << ",\"activeChannels\":\"" << activeInputChannels.toString(2).toStdString() << "\",\"selectedChannel\":" << selectedInputChannel_ << ",\"actualChannelIndex\":" << actualChannelIndex << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        }
+    }
+
+    if (actualChannelIndex < 0 || actualChannelIndex >= numInputChannels)
+    {
+        if (logCounter % 100 == 0)
+        {
+            std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open())
+            {
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H6\",\"location\":\"MainComponent.cpp:205\",\"message\":\"Invalid mapped channel index\",\"data\":{\"selectedChannel\":" << selectedInputChannel_ << ",\"actualChannelIndex\":" << actualChannelIndex << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+            }
+        }
+
+        currentInputLevel_.store(0.0f);
+        currentInputLevelDb_.store(-100.0f);
+        return;
+    }
+
+    const float* channelData = inputChannelData[actualChannelIndex];
+    if (channelData == nullptr)
+    {
+        currentInputLevel_.store(0.0f);
+        currentInputLevelDb_.store(-100.0f);
+        return;
+    }
+
+    float sumSquared = 0.0f;
+    float maxSample = 0.0f;
+    float minSample = 0.0f;
+    int nonZeroSamples = 0;
+    const float firstSample = channelData[0];
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const float sample = channelData[i];
+        sumSquared += sample * sample;
+        if (std::abs(sample) > 0.0001f)
+            ++nonZeroSamples;
+        maxSample = juce::jmax(maxSample, sample);
+        minSample = juce::jmin(minSample, sample);
+    }
+
+    const float rms = std::sqrt(sumSquared / static_cast<float>(juce::jmax(1, numSamples)));
+    const float normalizedLevel = juce::jlimit(0.0f, 1.0f, rms * 1.414f);
+    const float levelDb = (normalizedLevel > 0.0f) ? 20.0f * std::log10(normalizedLevel) : -100.0f;
+
+    currentInputLevel_.store(normalizedLevel);
+    currentInputLevelDb_.store(levelDb);
+
+    if (logCounter % 100 == 0)
+    {
+        std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open())
+        {
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H4\",\"location\":\"MainComponent.cpp:185\",\"message\":\"Audio samples analysis (input monitor)\",\"data\":{\"rms\":" << rms << ",\"maxSample\":" << maxSample << ",\"minSample\":" << minSample << ",\"nonZeroSamples\":" << nonZeroSamples << ",\"totalSamples\":" << numSamples << ",\"firstSample\":" << firstSample << ",\"actualChannelIndex\":" << actualChannelIndex << ",\"levelDb\":" << levelDb << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        }
+    }
+
+    if (ravennaInitialized_ && ravennaManager_.isActive())
+    {
+        ravennaManager_.sendAudio(channelData, numSamples);
+    }
 }
+
+void MainComponent::handleInputDeviceAboutToStart(juce::AudioIODevice* device)
+{
+    {
+        std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open())
+        {
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H7\",\"location\":\"MainComponent.cpp:360\",\"message\":\"audioDeviceAboutToStart\",\"data\":{\"deviceName\":\"" << (device ? device->getName().toStdString() : "null") << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        }
+    }
+
+    juce::MessageManager::callAsync([this] { updateInputChannels(); });
+}
+
+void MainComponent::handleInputDeviceStopped()
+{
+    {
+        std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open())
+        {
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H7\",\"location\":\"MainComponent.cpp:375\",\"message\":\"audioDeviceStopped\",\"data\":{},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        }
+    }
+
+    currentInputLevel_.store(0.0f);
+    currentInputLevelDb_.store(-100.0f);
+}
+
+void MainComponent::InputMonitor::audioDeviceIOCallbackWithContext(const float* const* inputChannelData,
+                                                                   int numInputChannels,
+                                                                   float* const* outputChannelData,
+                                                                   int numOutputChannels,
+                                                                   int numSamples,
+                                                                   const juce::AudioIODeviceCallbackContext& context)
+{
+    juce::ignoreUnused(outputChannelData, numOutputChannels, context);
+    owner_.handleIncomingAudio(inputChannelData, numInputChannels, numSamples);
+}
+
+void MainComponent::InputMonitor::audioDeviceAboutToStart(juce::AudioIODevice* device)
+{
+    owner_.handleInputDeviceAboutToStart(device);
+}
+
+void MainComponent::InputMonitor::audioDeviceStopped()
+{
+    owner_.handleInputDeviceStopped();
+}
+
 
 void MainComponent::paint(Graphics& g)
 {
@@ -133,8 +309,8 @@ void MainComponent::resized()
     const int labelWidth = 150;
     const int controlHeight = 30;
     
-    // Audio device selector at the top
-    auto selectorBounds = bounds.removeFromTop(300);
+    // Audio device selector at the top (reduced height to make room for other controls)
+    auto selectorBounds = bounds.removeFromTop(400);
     selector.setBounds(selectorBounds);
     
     bounds.removeFromTop(margin);
@@ -144,9 +320,17 @@ void MainComponent::resized()
     networkInterfaceCombo_.setBounds(networkBounds.removeFromLeft(300).withTrimmedLeft(labelWidth));
     bounds.removeFromTop(margin);
     
-    // Input channel selection
+    // Input channel selection with level meter
     auto channelBounds = bounds.removeFromTop(controlHeight);
-    inputChannelCombo_.setBounds(channelBounds.removeFromLeft(300).withTrimmedLeft(labelWidth));
+    auto comboBounds = channelBounds.removeFromLeft(300).withTrimmedLeft(labelWidth);
+    inputChannelCombo_.setBounds(comboBounds);
+    
+    // Place level meter next to the combo box
+    auto meterBounds = channelBounds.removeFromLeft(200).reduced(5, 5);
+    inputLevelMeter_.setBounds(meterBounds);
+    
+    auto valueBounds = channelBounds.removeFromLeft(120).reduced(5, 2);
+    inputLevelValueLabel_.setBounds(valueBounds);
     bounds.removeFromTop(margin);
     
     // PTP status
@@ -205,7 +389,18 @@ void MainComponent::updateInputChannels()
     auto* device = deviceManager.getCurrentAudioDevice();
     if (device != nullptr)
     {
-        const int numInputChannels = device->getActiveInputChannels().countNumberOfSetBits();
+        juce::BigInteger activeInputs = device->getActiveInputChannels();
+        const int numInputChannels = activeInputs.countNumberOfSetBits();
+        
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H5\",\"location\":\"MainComponent.cpp:235\",\"message\":\"updateInputChannels\",\"data\":{\"deviceName\":\"" << device->getName().toStdString() << "\",\"numActiveInputChannels\":" << numInputChannels << ",\"activeInputChannels\":\"" << activeInputs.toString(2).toStdString() << "\",\"totalInputChannels\":" << device->getInputChannelNames().size() << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+            }
+        }
+        // #endregion
+        
         for (int i = 0; i < numInputChannels; ++i)
         {
             inputChannelCombo_.addItem("Channel " + juce::String(i + 1), i + 1);
@@ -320,6 +515,12 @@ void MainComponent::timerCallback()
     {
         ravennaManager_.checkAndRetryPtpIfStuck();
     }
+    
+    // Update input level meter
+    inputLevelMeter_.setLevel(currentInputLevel_.load());
+    const float levelDb = currentInputLevelDb_.load();
+    const juce::String levelText = (levelDb <= -90.0f) ? "-inf dB" : juce::String(levelDb, 1) + " dB";
+    inputLevelValueLabel_.setText(levelText, juce::dontSendNotification);
     
     // Update sender status
     if (ravennaManager_.isActive())
