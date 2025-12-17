@@ -34,8 +34,6 @@ RavennaNodeManager::RavennaNodeManager()
     : isActive_(false)
     , rtpTimestamp_(0)
 {
-    senderIds_.reserve(kMaxSenders);
-    senderEnabled_.resize(kMaxSenders, false);
 }
 
 RavennaNodeManager::~RavennaNodeManager()
@@ -270,13 +268,8 @@ bool RavennaNodeManager::initialize()
         // #endregion
     }
     
-    // Create all 64 senders (disabled) so they're registered with NMOS
-    // This allows NMOS testing tools to discover our sender capabilities
-    // Senders will be enabled individually when streaming starts
-    createAllSenders();
-    
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:initialize:exit", "Initialization complete", "{\"interface\":\"" + currentInterface_ + "\",\"sendersCreated\":" + std::to_string(senderIds_.size()) + "}");
+    DEBUG_LOG("RavennaNodeManager.cpp:initialize:exit", "Initialization complete", "{\"interface\":\"" + currentInterface_ + "\"}");
     // #endregion
     
     return true;
@@ -285,7 +278,7 @@ bool RavennaNodeManager::initialize()
 bool RavennaNodeManager::start(const std::string& sessionName)
 {
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:start:entry", "start() called", "{\"sessionName\":\"" + sessionName + "\",\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
+    DEBUG_LOG("RavennaNodeManager.cpp:start:entry", "start() called", "{\"sessionName\":\"" + sessionName + "\"}");
     // #endregion
     
     if (!node_)
@@ -296,6 +289,7 @@ bool RavennaNodeManager::start(const std::string& sessionName)
         return false;
     }
     
+    // If already active, do nothing (single-sender UI)
     if (isActive_)
     {
         // #region agent log
@@ -304,18 +298,8 @@ bool RavennaNodeManager::start(const std::string& sessionName)
         return true; // Already started
     }
     
-    // Enable the first sender (index 0)
-    const size_t senderIndex = 0;
-    
-    if (senderIndex >= senderIds_.size() || !senderIds_[senderIndex].is_valid())
-    {
-        // #region agent log
-        DEBUG_LOG("RavennaNodeManager.cpp:start:no_sender", "Sender 0 not available", "{\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
-        // #endregion
-        return false;
-    }
-    
-    // Create enabled configuration for sender 0
+    // Build a sender configuration for this new sender (index based on current count)
+    const size_t senderIndex = activeSenders_.size();
     auto senderConfig = createSenderConfig(senderIndex, true);
     senderConfig.session_name = sessionName;
     
@@ -331,8 +315,8 @@ bool RavennaNodeManager::start(const std::string& sessionName)
     }
     // #endregion
     
-    // Update the sender configuration to enable it
-    auto result = node_->update_sender_configuration(senderIds_[senderIndex], senderConfig).get();
+    // Create the sender (enabled)
+    auto result = node_->create_sender(senderConfig).get();
     if (!result)
     {
         // #region agent log
@@ -344,17 +328,21 @@ bool RavennaNodeManager::start(const std::string& sessionName)
             else if (c == '\n') escapedError += "\\n";
             else escapedError += c;
         }
-        DEBUG_LOG("RavennaNodeManager.cpp:start:update_failed", "update_sender_configuration() failed", "{\"error\":\"" + escapedError + "\"}");
+        DEBUG_LOG("RavennaNodeManager.cpp:start:create_failed", "create_sender() failed", "{\"error\":\"" + escapedError + "\"}");
         // #endregion
         return false;
     }
     
-    senderEnabled_[senderIndex] = true;
+    SenderInstance instance;
+    instance.id = *result;
+    instance.config = senderConfig;
+    instance.enabled = true;
+    activeSenders_.push_back(instance);
     isActive_ = true;
-    rtpTimestamp_ = 0;
+    rtpTimestamp_ = ptpSubscriber_ ? ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate) : 0;
     
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:start:success", "Sender 0 enabled successfully", "{\"senderId\":\"" + senderIds_[senderIndex].to_string() + "\"}");
+    DEBUG_LOG("RavennaNodeManager.cpp:start:success", "Sender created and enabled", "{\"senderId\":\"" + instance.id.to_string() + "\"}");
     // #endregion
     
     return true;
@@ -368,26 +356,24 @@ void RavennaNodeManager::stop()
     }
     
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:stop:entry", "Stopping RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
+    DEBUG_LOG("RavennaNodeManager.cpp:stop:entry", "Stopping RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numActive\":" + std::to_string(activeSenders_.size()) + "}");
     // #endregion
     
-    // Disable all enabled senders (but keep them registered with NMOS for discovery)
-    for (size_t i = 0; i < senderIds_.size(); ++i)
+    // Remove all active senders
+    for (auto& sender : activeSenders_)
     {
-        if (senderIds_[i].is_valid() && senderEnabled_[i])
+        if (sender.id.is_valid())
         {
-            auto disabledConfig = createSenderConfig(i, false);
-            node_->update_sender_configuration(senderIds_[i], disabledConfig).wait();
-            senderEnabled_[i] = false;
-            
+            node_->remove_sender(sender.id).wait();
             // #region agent log
-            DEBUG_LOG("RavennaNodeManager.cpp:stop:sender_disabled", "Sender disabled", "{\"senderIndex\":" + std::to_string(i) + "}");
+            DEBUG_LOG("RavennaNodeManager.cpp:stop:sender_removed", "Sender removed", "{\"senderId\":\"" + sender.id.to_string() + "\"}");
             // #endregion
         }
     }
+    activeSenders_.clear();
     
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:stop:complete", "Streaming stopped (NMOS resources still registered)", "{}");
+    DEBUG_LOG("RavennaNodeManager.cpp:stop:complete", "Streaming stopped and senders removed", "{}");
     // #endregion
     
     isActive_ = false;
@@ -401,22 +387,21 @@ void RavennaNodeManager::shutdown()
     }
     
     // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:shutdown:entry", "Shutting down RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numSenders\":" + std::to_string(senderIds_.size()) + "}");
+    DEBUG_LOG("RavennaNodeManager.cpp:shutdown:entry", "Shutting down RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numActive\":" + std::to_string(activeSenders_.size()) + "}");
     // #endregion
     
     // Remove all senders completely on shutdown
-    for (size_t i = 0; i < senderIds_.size(); ++i)
+    for (auto& sender : activeSenders_)
     {
-        if (senderIds_[i].is_valid())
+        if (sender.id.is_valid())
         {
-            node_->remove_sender(senderIds_[i]).wait();
+            node_->remove_sender(sender.id).wait();
             // #region agent log
-            DEBUG_LOG("RavennaNodeManager.cpp:shutdown:sender_removed", "Sender removed", "{\"senderIndex\":" + std::to_string(i) + "}");
+            DEBUG_LOG("RavennaNodeManager.cpp:shutdown:sender_removed", "Sender removed", "{\"senderId\":\"" + sender.id.to_string() + "\"}");
             // #endregion
         }
     }
-    senderIds_.clear();
-    senderEnabled_.clear();
+    activeSenders_.clear();
     
     // Unsubscribe from PTP instance to properly release multicast group memberships
     if (ptpSubscriber_)
@@ -439,16 +424,7 @@ void RavennaNodeManager::shutdown()
 
 bool RavennaNodeManager::isActive() const
 {
-    return isActive_ && !senderIds_.empty() && senderIds_[0].is_valid();
-}
-
-bool RavennaNodeManager::isSenderEnabled(size_t senderIndex) const
-{
-    if (senderIndex >= senderEnabled_.size())
-    {
-        return false;
-    }
-    return senderEnabled_[senderIndex];
+    return isActive_ && !activeSenders_.empty() && activeSenders_[0].id.is_valid();
 }
 
 bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
@@ -496,13 +472,13 @@ bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
     const float* channels[] = { audioData };
     rav::AudioBufferView<const float> bufferView(channels, kNumChannels, static_cast<size_t>(numSamples));
     
-    // Send audio data with PTP-synced RTP timestamp (to sender 0)
-    if (senderIds_.empty() || !senderIds_[0].is_valid())
+    // Send audio data with PTP-synced RTP timestamp to the first active sender
+    if (activeSenders_.empty() || !activeSenders_[0].id.is_valid())
     {
         return false;
     }
     
-    if (!node_->send_audio_data_realtime(senderIds_[0], bufferView, rtpTimestamp_))
+    if (!node_->send_audio_data_realtime(activeSenders_[0].id, bufferView, rtpTimestamp_))
     {
         return false;
     }
@@ -753,63 +729,7 @@ rav::RavennaSender::Configuration RavennaNodeManager::createSenderConfig(size_t 
     return config;
 }
 
-void RavennaNodeManager::createAllSenders()
-{
-    if (!node_)
-    {
-        return;
-    }
-    
-    // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:createAllSenders:entry", "Creating all senders for NMOS registration", "{\"count\":" + std::to_string(kMaxSenders) + "}");
-    // #endregion
-    
-    senderIds_.clear();
-    senderIds_.reserve(kMaxSenders);
-    
-    size_t successCount = 0;
-    size_t failCount = 0;
-    
-    for (size_t i = 0; i < kMaxSenders; ++i)
-    {
-        // Create disabled sender configuration
-        auto senderConfig = createSenderConfig(i, false);
-        
-        // Create the sender
-        auto result = node_->create_sender(senderConfig).get();
-        if (result)
-        {
-            senderIds_.push_back(*result);
-            senderEnabled_[i] = false;
-            successCount++;
-        }
-        else
-        {
-            // Push invalid ID to maintain index alignment
-            senderIds_.push_back(rav::Id());
-            failCount++;
-            
-            // Log first failure in detail
-            if (failCount == 1)
-            {
-                // #region agent log
-                std::string errorMsg = result.error();
-                std::string escapedError;
-                for (char c : errorMsg) {
-                    if (c == '"') escapedError += "\\\"";
-                    else if (c == '\\') escapedError += "\\\\";
-                    else escapedError += c;
-                }
-                DEBUG_LOG("RavennaNodeManager.cpp:createAllSenders:first_failure", "First sender creation failed", "{\"senderIndex\":" + std::to_string(i) + ",\"error\":\"" + escapedError + "\"}");
-                // #endregion
-            }
-        }
-    }
-    
-    // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:createAllSenders:complete", "Sender creation complete", "{\"success\":" + std::to_string(successCount) + ",\"failed\":" + std::to_string(failCount) + "}");
-    // #endregion
-}
+// (createAllSenders removed - senders are now created on demand)
 
 } // namespace AudioApp
 

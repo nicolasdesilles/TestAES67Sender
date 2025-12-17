@@ -119,27 +119,17 @@ public:
      */
     bool checkAndRetryPtpIfStuck();
 
-    /**
-     * Get the number of pre-created senders.
-     * @return Number of senders (currently 64)
-     */
-    size_t getNumSenders() const { return senderIds_.size(); }
-    
-    /**
-     * Check if a specific sender is enabled.
-     * @param senderIndex Index of the sender (0-63)
-     * @return true if the sender is enabled
-     */
-    bool isSenderEnabled(size_t senderIndex) const;
-
 private:
-    // Maximum number of senders (one per JUCE output channel)
-    static constexpr size_t kMaxSenders = 64;
+    struct SenderInstance
+    {
+        rav::Id id;
+        rav::RavennaSender::Configuration config;
+        bool enabled{false};
+    };
     
     std::unique_ptr<rav::RavennaNode> node_;
-    std::vector<rav::Id> senderIds_;  // Array of 64 sender IDs
-    std::vector<bool> senderEnabled_; // Track which senders are enabled
-    std::atomic<bool> isActive_;      // True if at least one sender is active
+    std::vector<SenderInstance> activeSenders_; // Dynamically created senders
+    std::atomic<bool> isActive_;                // True if at least one sender is active
     std::string currentInterface_;
     
     // PTP subscriber to monitor synchronization
@@ -228,7 +218,6 @@ private:
     static constexpr uint32_t kNumChannels = 1; // Mono
     
     // Helper methods
-    void createAllSenders();
     boost::asio::ip::address_v4 generateMulticastAddress(size_t senderIndex);
     rav::RavennaSender::Configuration createSenderConfig(size_t senderIndex, bool enabled);
 };
