@@ -15,6 +15,7 @@
 #include <sstream>
 #include <fstream>
 #include <chrono>
+#include <cstdlib>
 
 // #region agent log
 #define DEBUG_LOG(loc, msg, data) do { \
@@ -28,6 +29,125 @@
 
 namespace AudioApp
 {
+
+void RavennaNodeManager::NodeSubscriber::nmos_node_config_updated(const rav::nmos::Node::Configuration& config)
+{
+    owner_.setNmosConfigSnapshot(config);
+}
+
+void RavennaNodeManager::NodeSubscriber::nmos_node_status_changed(const rav::nmos::Node::Status status, const rav::nmos::Node::StatusInfo& registry_info)
+{
+    owner_.setNmosStatusSnapshot(status, registry_info);
+}
+
+const char* RavennaNodeManager::nmosStatusToString(rav::nmos::Node::Status status)
+{
+    switch (status)
+    {
+        case rav::nmos::Node::Status::disabled: return "disabled";
+        case rav::nmos::Node::Status::discovering: return "discovering";
+        case rav::nmos::Node::Status::connecting: return "connecting";
+        case rav::nmos::Node::Status::connected: return "connected";
+        case rav::nmos::Node::Status::registered: return "registered";
+        case rav::nmos::Node::Status::p2p: return "p2p";
+        case rav::nmos::Node::Status::error: return "error";
+    }
+    return "unknown";
+}
+
+void RavennaNodeManager::setNmosConfigSnapshot(const rav::nmos::Node::Configuration& config)
+{
+    std::lock_guard<std::mutex> lock(nmosMutex_);
+    nmosConfigSnapshot_ = config;
+}
+
+void RavennaNodeManager::setNmosStatusSnapshot(rav::nmos::Node::Status status, const rav::nmos::Node::StatusInfo& info)
+{
+    std::lock_guard<std::mutex> lock(nmosMutex_);
+    nmosStatus_ = status;
+    nmosRegistryInfo_ = info;
+}
+
+std::string RavennaNodeManager::getNmosStatusText() const
+{
+    std::lock_guard<std::mutex> lock(nmosMutex_);
+
+    std::string s = std::string(nmosStatusToString(nmosStatus_));
+    if (!nmosRegistryInfo_.address.empty())
+    {
+        // registry_info.address may already contain scheme/host/port (URL). Avoid appending another port.
+        s += " (" + nmosRegistryInfo_.address + ")";
+    }
+    return s;
+}
+
+std::string RavennaNodeManager::getNmosDiagnostics() const
+{
+    std::lock_guard<std::mutex> lock(nmosMutex_);
+
+    std::string out;
+    out += "Status: " + std::string(nmosStatusToString(nmosStatus_)) + "\n";
+    out += "Mode: " + std::string(rav::nmos::to_string(nmosConfigSnapshot_.operation_mode)) + "\n";
+    out += "Node API port: " + std::to_string(nmosConfigSnapshot_.api_port) + "\n";
+
+    out += "Configured registry address: ";
+    out += configuredRegistryAddress_.empty() ? "(mDNS auto)" : configuredRegistryAddress_;
+    out += "\n";
+
+    out += "Registry: ";
+    if (!nmosRegistryInfo_.address.empty())
+    {
+        // Show address and api_port separately to avoid "http://host:port:port" formatting.
+        out += nmosRegistryInfo_.address;
+        if (!nmosRegistryInfo_.name.empty())
+            out += " (" + nmosRegistryInfo_.name + ")";
+        out += "\n";
+        out += "Registry API port: " + std::to_string(nmosRegistryInfo_.api_port);
+    }
+    else
+    {
+        out += "(none)";
+    }
+    out += "\n";
+
+    out += "NMOS Node ID: " + (nmosNodeId_.is_nil() ? std::string("(unknown)") : boost::uuids::to_string(nmosNodeId_)) + "\n";
+    out += "NMOS Device ID: " + (nmosDeviceId_.is_nil() ? std::string("(unknown)") : boost::uuids::to_string(nmosDeviceId_)) + "\n";
+    return out;
+}
+
+std::string RavennaNodeManager::getSenderDiagnostics() const
+{
+    std::stringstream ss;
+    ss << "Interface: " << (currentInterface_.empty() ? "(auto)" : currentInterface_) << "\n";
+    ss << "Active: " << (isActive_.load() ? "Yes" : "No") << "\n";
+    ss << "Senders: " << activeSenders_.size() << "\n";
+    ss << "NMOS port: " << nmosPort_ << "\n";
+
+    for (size_t i = 0; i < activeSenders_.size(); ++i)
+    {
+        const auto& s = activeSenders_[i];
+        ss << "\nSender[" << i << "]\n";
+        ss << "  ID: " << s.id.to_string() << "\n";
+        ss << "  Session: " << s.config.session_name << "\n";
+        ss << "  Enabled: " << (s.enabled ? "Yes" : "No") << "\n";
+        ss << "  Format: " << (s.config.audio_format.sample_rate) << " Hz, "
+           << static_cast<int>(s.config.audio_format.num_channels) << " ch, "
+           << rav::to_string(s.config.audio_format.encoding) << "\n";
+        ss << "  Packet time: "
+           << static_cast<int>(s.config.packet_time.fraction.numerator) << "/"
+           << static_cast<int>(s.config.packet_time.fraction.denominator)
+           << " (signaled_ptime_ms=" << s.config.packet_time.signaled_ptime(s.config.audio_format.sample_rate) << ")\n";
+        ss << "  Payload type: " << static_cast<int>(s.config.payload_type) << "\n";
+        ss << "  TTL: " << static_cast<int>(s.config.ttl) << "\n";
+        if (!s.config.destinations.empty())
+        {
+            const auto& d = s.config.destinations[0];
+            ss << "  Dest: " << d.endpoint.address().to_string() << ":" << d.endpoint.port()
+               << " (enabled=" << (d.enabled ? "true" : "false") << ")\n";
+        }
+    }
+    return ss.str();
+}
 
 // RavennaNodeManager implementation
 RavennaNodeManager::RavennaNodeManager()
@@ -55,6 +175,10 @@ bool RavennaNodeManager::initialize()
     
     // Create the RAVENNA node
     node_ = std::make_unique<rav::RavennaNode>();
+
+    // Subscribe to node callbacks (NMOS status/config updates, etc.)
+    nodeSubscriber_ = std::make_unique<NodeSubscriber>(*this);
+    node_->subscribe(nodeSubscriber_.get()).wait();
     
     // #region agent log
     DEBUG_LOG("RavennaNodeManager.cpp:initialize:node_created", "RAVENNA node created", "{}");
@@ -222,9 +346,43 @@ bool RavennaNodeManager::initialize()
     rav::nmos::Node::Configuration nmosConfig;
     nmosConfig.id = boost::uuids::random_generator()();  // Required: generate a unique UUID for this node
     nmosConfig.enabled = true;
-    nmosConfig.api_port = 80;  // Standard HTTP port for NMOS testing (or use 5555 for non-privileged)
+    nmosNodeId_ = nmosConfig.id;
+    nmosConfig.api_port = 80;  // Default to 80 (as tested), fallback to 5555 if binding fails
     nmosConfig.label = "TestAES67Sender";
     nmosConfig.description = "RAVENNA AES67 Sender";
+
+    // Prefer registry operation.
+    // - If NMOS_REGISTRY_ADDRESS is set (e.g. "http://easy-nmos.local:8010"), use manual mode.
+    // - Otherwise, use mDNS registry discovery (falls back to p2p only if no registry is available).
+    configuredRegistryAddress_.clear();
+    if (const char* envRegistry = std::getenv("NMOS_REGISTRY_ADDRESS"); envRegistry && std::string(envRegistry).size() > 0)
+    {
+        configuredRegistryAddress_ = envRegistry;
+
+        // Allow passing just host/ip (e.g. "nmos-registry.local" or "192.168.12.161")
+        // - if no scheme: assume http
+        // - if no port: assume 80 (matches nmos-cpp docker default; if you need a different port, specify it explicitly)
+        const bool hasScheme = (configuredRegistryAddress_.find("://") != std::string::npos);
+        if (!hasScheme)
+            configuredRegistryAddress_ = "http://" + configuredRegistryAddress_;
+
+        // crude port detection: if there's no ':' after the scheme separator, append :8010
+        const auto schemePos = configuredRegistryAddress_.find("://");
+        const auto hostStart = (schemePos == std::string::npos) ? 0u : static_cast<unsigned>(schemePos + 3);
+        const auto hostPort = configuredRegistryAddress_.substr(hostStart);
+        const bool hasPort = (hostPort.find(':') != std::string::npos);
+        if (!hasPort)
+            configuredRegistryAddress_ += ":80";
+
+        nmosConfig.operation_mode = rav::nmos::OperationMode::manual;
+        nmosConfig.registry_address = configuredRegistryAddress_;
+    }
+    else
+    {
+        nmosConfig.operation_mode = rav::nmos::OperationMode::mdns_p2p;
+    }
+
+    setNmosConfigSnapshot(nmosConfig);
     
     // #region agent log
     DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_config", "NMOS configuration prepared", "{\"id\":\"" + boost::uuids::to_string(nmosConfig.id) + "\",\"port\":" + std::to_string(nmosConfig.api_port) + "}");
@@ -233,32 +391,34 @@ bool RavennaNodeManager::initialize()
     auto nmosResult = node_->set_nmos_configuration(nmosConfig).get();
     if (!nmosResult)
     {
-        // NMOS setup failed - try with a non-privileged port if port 80 failed
+        // If binding to 80 failed, retry with a non-privileged port (common on macOS if launched without permissions)
         nmosConfig.api_port = 5555;
-        // #region agent log
-        DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_retry", "NMOS failed on port 80, retrying with port 5555", "{}");
-        // #endregion
-        nmosResult = node_->set_nmos_configuration(nmosConfig).get();
-        if (!nmosResult)
+        setNmosConfigSnapshot(nmosConfig);
+        auto retryResult = node_->set_nmos_configuration(nmosConfig).get();
+        if (retryResult)
         {
-            // #region agent log
-            std::string errorMsg = nmosResult.error();
-            std::string escapedError;
-            for (char c : errorMsg) {
-                if (c == '"') escapedError += "\\\"";
-                else if (c == '\\') escapedError += "\\\\";
-                else escapedError += c;
-            }
-            DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_failed", "NMOS configuration failed", "{\"error\":\"" + escapedError + "\"}");
-            // #endregion
+            nmosPort_ = nmosConfig.api_port;
+            DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_success", "NMOS configuration succeeded (retry)", "{\"port\":" + std::to_string(nmosConfig.api_port) + "}");
+            try { nmosDeviceId_ = node_->get_nmos_device_id().get(); } catch (...) {}
         }
         else
         {
-            nmosPort_ = nmosConfig.api_port;
-            // #region agent log
-            DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_success", "NMOS configuration succeeded", "{\"port\":" + std::to_string(nmosConfig.api_port) + "}");
-            // #endregion
+            nmosResult = retryResult;
         }
+    }
+
+    if (!nmosResult)
+    {
+        // #region agent log
+        std::string errorMsg = nmosResult.error();
+        std::string escapedError;
+        for (char c : errorMsg) {
+            if (c == '"') escapedError += "\\\"";
+            else if (c == '\\') escapedError += "\\\\";
+            else escapedError += c;
+        }
+        DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_failed", "NMOS configuration failed", "{\"error\":\"" + escapedError + "\"}");
+        // #endregion
     }
     else
     {
@@ -266,6 +426,16 @@ bool RavennaNodeManager::initialize()
         // #region agent log
         DEBUG_LOG("RavennaNodeManager.cpp:initialize:nmos_success", "NMOS configuration succeeded", "{\"port\":" + std::to_string(nmosConfig.api_port) + "}");
         // #endregion
+
+        // Cache NMOS device id for UI (best-effort)
+        try
+        {
+            nmosDeviceId_ = node_->get_nmos_device_id().get();
+        }
+        catch (...)
+        {
+            // Ignore
+        }
     }
     
     // #region agent log
@@ -410,6 +580,13 @@ void RavennaNodeManager::shutdown()
         // #region agent log
         DEBUG_LOG("RavennaNodeManager.cpp:shutdown:ptp_unsubscribed", "PTP subscriber unsubscribed", "{}");
         // #endregion
+    }
+
+    // Unsubscribe from node callbacks before destroying the node
+    if (nodeSubscriber_)
+    {
+        node_->unsubscribe(nodeSubscriber_.get()).wait();
+        nodeSubscriber_.reset();
     }
     
     // Reset the node to trigger proper cleanup of sockets and multicast memberships

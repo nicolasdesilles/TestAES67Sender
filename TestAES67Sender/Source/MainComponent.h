@@ -24,6 +24,7 @@ private:
     void updateNetworkInterfaces();
     void updateInputChannels();
     void updatePtpStatus();
+    void updateNmosStatus();
     void onNetworkInterfaceChanged();
     void onInputChannelChanged();
     void onStartStopClicked();
@@ -45,8 +46,16 @@ private:
     juce::Label ptpStatusValue_;
     juce::Label ptpDiagnosticsLabel_;
     juce::TextEditor ptpDiagnosticsText_;
+
+    juce::Label nmosStatusLabel_;
+    juce::Label nmosStatusValue_;
+    juce::Label nmosDiagnosticsLabel_;
+    juce::TextEditor nmosDiagnosticsText_;
+
     juce::Label senderStatusLabel_;
     juce::Label senderStatusValue_;
+    juce::Label senderDiagnosticsLabel_;
+    juce::TextEditor senderDiagnosticsText_;
     juce::TextButton startStopButton_;
     
     // Signal meter component

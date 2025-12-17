@@ -15,6 +15,10 @@ MainComponent::MainComponent()
     , ptpStatusValue_("ptpStatus", "Not Synchronized")
     , ptpDiagnosticsLabel_("PTP Diagnostics:", "PTP Diagnostics:")
     , ptpDiagnosticsText_()
+    , nmosStatusLabel_("NMOS Status:", "NMOS Status:")
+    , nmosStatusValue_("nmosStatus", "Unknown")
+    , nmosDiagnosticsLabel_("NMOS Diagnostics:", "NMOS Diagnostics:")
+    , nmosDiagnosticsText_()
     , senderStatusLabel_("Sender Status:", "Sender Status:")
     , senderStatusValue_("senderStatus", "Stopped")
     , senderDiagnosticsLabel_("Sender Diagnostics:", "Sender Diagnostics:")
@@ -57,6 +61,18 @@ MainComponent::MainComponent()
     ptpDiagnosticsText_.setReadOnly(true);
     ptpDiagnosticsText_.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 10.0f, 0));
     addAndMakeVisible(ptpDiagnosticsText_);
+
+    // Setup NMOS status
+    nmosStatusLabel_.attachToComponent(&nmosStatusValue_, true);
+    nmosStatusValue_.setColour(juce::Label::textColourId, juce::Colours::lightblue);
+    addAndMakeVisible(nmosStatusValue_);
+
+    // Setup NMOS diagnostics
+    nmosDiagnosticsLabel_.attachToComponent(&nmosDiagnosticsText_, true);
+    nmosDiagnosticsText_.setMultiLine(true);
+    nmosDiagnosticsText_.setReadOnly(true);
+    nmosDiagnosticsText_.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 10.0f, 0));
+    addAndMakeVisible(nmosDiagnosticsText_);
     
     // Setup sender status
     senderStatusLabel_.attachToComponent(&senderStatusValue_, true);
@@ -87,7 +103,7 @@ MainComponent::MainComponent()
     // Start timer to update status displays
     startTimer(500); // Update every 500ms
     
-    setSize(900, 1000);
+    setSize(900, 1150);
 }
 
 MainComponent::~MainComponent()
@@ -357,6 +373,16 @@ void MainComponent::resized()
     senderStatusValue_.setBounds(senderBounds.removeFromLeft(300).withTrimmedLeft(labelWidth));
     bounds.removeFromTop(margin);
 
+    // NMOS status
+    auto nmosBounds = bounds.removeFromTop(controlHeight);
+    nmosStatusValue_.setBounds(nmosBounds.removeFromLeft(300).withTrimmedLeft(labelWidth));
+    bounds.removeFromTop(margin);
+
+    // NMOS diagnostics
+    auto nmosDiagBounds = bounds.removeFromTop(140);
+    nmosDiagnosticsText_.setBounds(nmosDiagBounds.removeFromLeft(bounds.getWidth() - labelWidth).withTrimmedLeft(labelWidth));
+    bounds.removeFromTop(margin);
+
     // Sender diagnostics
     auto senderDiagBounds = bounds.removeFromTop(180);
     senderDiagnosticsText_.setBounds(senderDiagBounds.removeFromLeft(bounds.getWidth() - labelWidth).withTrimmedLeft(labelWidth));
@@ -458,6 +484,31 @@ void MainComponent::updatePtpStatus()
     ptpDiagnosticsText_.setText(juce::String(diagnostics), juce::dontSendNotification);
 }
 
+void MainComponent::updateNmosStatus()
+{
+    if (!ravennaInitialized_)
+    {
+        nmosStatusValue_.setText("Not Initialized", juce::dontSendNotification);
+        nmosStatusValue_.setColour(juce::Label::textColourId, juce::Colours::red);
+        nmosDiagnosticsText_.setText("RAVENNA not initialized", juce::dontSendNotification);
+        return;
+    }
+
+    const auto statusText = ravennaManager_.getNmosStatusText();
+    nmosStatusValue_.setText(juce::String(statusText), juce::dontSendNotification);
+    nmosDiagnosticsText_.setText(juce::String(ravennaManager_.getNmosDiagnostics()), juce::dontSendNotification);
+
+    // Colour hint
+    if (statusText.find("registered") != std::string::npos)
+        nmosStatusValue_.setColour(juce::Label::textColourId, juce::Colours::green);
+    else if (statusText.find("p2p") != std::string::npos)
+        nmosStatusValue_.setColour(juce::Label::textColourId, juce::Colours::orange);
+    else if (statusText.find("error") != std::string::npos)
+        nmosStatusValue_.setColour(juce::Label::textColourId, juce::Colours::red);
+    else
+        nmosStatusValue_.setColour(juce::Label::textColourId, juce::Colours::lightblue);
+}
+
 void MainComponent::onNetworkInterfaceChanged()
 {
     if (networkInterfaceCombo_.getSelectedId() > 0)
@@ -523,6 +574,7 @@ void MainComponent::onStartStopClicked()
 void MainComponent::timerCallback()
 {
     updatePtpStatus();
+    updateNmosStatus();
     
     // Check if PTP is stuck and needs retry (helps with "first launch after build" issue on macOS)
     if (ravennaInitialized_)

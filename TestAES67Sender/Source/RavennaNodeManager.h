@@ -11,6 +11,7 @@
 #include <vector>
 #include <memory>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -110,6 +111,21 @@ public:
      * @return The port number the NMOS HTTP server is listening on, or 0 if not running
      */
     uint16_t getNmosPort() const { return nmosPort_; }
+
+    /**
+     * Get a short NMOS status string (registry connection/registration state).
+     */
+    std::string getNmosStatusText() const;
+
+    /**
+     * Get detailed NMOS diagnostics (mode, registry info, IDs).
+     */
+    std::string getNmosDiagnostics() const;
+
+    /**
+     * Get sender diagnostics (active sender IDs, destinations, audio format, etc.).
+     */
+    std::string getSenderDiagnostics() const;
     
     /**
      * Check if PTP is stuck and needs retry.
@@ -120,6 +136,19 @@ public:
     bool checkAndRetryPtpIfStuck();
 
 private:
+    // Receives RavennaNode callbacks (NMOS status/config, etc.) on the maintenance thread
+    class NodeSubscriber final : public rav::RavennaNode::Subscriber
+    {
+    public:
+        explicit NodeSubscriber(RavennaNodeManager& owner) : owner_(owner) {}
+
+        void nmos_node_config_updated(const rav::nmos::Node::Configuration& config) override;
+        void nmos_node_status_changed(const rav::nmos::Node::Status status, const rav::nmos::Node::StatusInfo& registry_info) override;
+
+    private:
+        RavennaNodeManager& owner_;
+    };
+
     struct SenderInstance
     {
         rav::Id id;
@@ -128,6 +157,7 @@ private:
     };
     
     std::unique_ptr<rav::RavennaNode> node_;
+    std::unique_ptr<NodeSubscriber> nodeSubscriber_;
     std::vector<SenderInstance> activeSenders_; // Dynamically created senders
     std::atomic<bool> isActive_;                // True if at least one sender is active
     std::string currentInterface_;
@@ -207,6 +237,15 @@ private:
     
     // NMOS port
     uint16_t nmosPort_{0};
+
+    // NMOS status (updated from maintenance thread, read from UI thread)
+    mutable std::mutex nmosMutex_;
+    rav::nmos::Node::Configuration nmosConfigSnapshot_{};
+    rav::nmos::Node::Status nmosStatus_{rav::nmos::Node::Status::disabled};
+    rav::nmos::Node::StatusInfo nmosRegistryInfo_{};
+    boost::uuids::uuid nmosNodeId_{};
+    boost::uuids::uuid nmosDeviceId_{};
+    std::string configuredRegistryAddress_;
     
     // PTP retry logic
     std::chrono::steady_clock::time_point ptpInitTime_;
@@ -220,6 +259,10 @@ private:
     // Helper methods
     boost::asio::ip::address_v4 generateMulticastAddress(size_t senderIndex);
     rav::RavennaSender::Configuration createSenderConfig(size_t senderIndex, bool enabled);
+
+    void setNmosConfigSnapshot(const rav::nmos::Node::Configuration& config);
+    void setNmosStatusSnapshot(rav::nmos::Node::Status status, const rav::nmos::Node::StatusInfo& info);
+    static const char* nmosStatusToString(rav::nmos::Node::Status status);
 };
 
 } // namespace AudioApp
