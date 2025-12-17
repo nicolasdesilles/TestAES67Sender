@@ -17,6 +17,8 @@ MainComponent::MainComponent()
     , ptpDiagnosticsText_()
     , senderStatusLabel_("Sender Status:", "Sender Status:")
     , senderStatusValue_("senderStatus", "Stopped")
+    , senderDiagnosticsLabel_("Sender Diagnostics:", "Sender Diagnostics:")
+    , senderDiagnosticsText_()
     , startStopButton_("Start Sending")
 {
     setAudioChannels(64, 64);
@@ -60,6 +62,13 @@ MainComponent::MainComponent()
     senderStatusLabel_.attachToComponent(&senderStatusValue_, true);
     senderStatusValue_.setColour(juce::Label::textColourId, juce::Colours::orange);
     addAndMakeVisible(senderStatusValue_);
+
+    // Setup sender diagnostics
+    senderDiagnosticsLabel_.attachToComponent(&senderDiagnosticsText_, true);
+    senderDiagnosticsText_.setMultiLine(true);
+    senderDiagnosticsText_.setReadOnly(true);
+    senderDiagnosticsText_.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 10.0f, 0));
+    addAndMakeVisible(senderDiagnosticsText_);
     
     // Setup start/stop button
     startStopButton_.onClick = [this] { onStartStopClicked(); };
@@ -347,6 +356,11 @@ void MainComponent::resized()
     auto senderBounds = bounds.removeFromTop(controlHeight);
     senderStatusValue_.setBounds(senderBounds.removeFromLeft(300).withTrimmedLeft(labelWidth));
     bounds.removeFromTop(margin);
+
+    // Sender diagnostics
+    auto senderDiagBounds = bounds.removeFromTop(180);
+    senderDiagnosticsText_.setBounds(senderDiagBounds.removeFromLeft(bounds.getWidth() - labelWidth).withTrimmedLeft(labelWidth));
+    bounds.removeFromTop(margin);
     
     // Start/Stop button
     startStopButton_.setBounds(bounds.removeFromTop(controlHeight + 10).removeFromLeft(200));
@@ -541,6 +555,9 @@ void MainComponent::timerCallback()
             startStopButton_.setButtonText("Start Sending");
         }
     }
+
+    // Update sender diagnostics
+    senderDiagnosticsText_.setText(juce::String(ravennaManager_.getSenderDiagnostics()), juce::dontSendNotification);
 }
 
 } // namespace AudioApp
