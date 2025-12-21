@@ -622,25 +622,33 @@ bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
     const auto& clock = ptpSubscriber_->get_local_clock();
     const auto ptpTimestamp = clock.now().to_rtp_timestamp32(kSampleRate);
     
-    // Calculate drift between PTP time and our current RTP timestamp
-    // Positive drift means audio device is ahead of PTP clock
+    // Calculate drift between PTP time and our current RTP timestamp using wrapping arithmetic
+    // Positive drift means PTP is ahead of our RTP timestamp (we're behind / sending slow)
+    // Negative drift means we're ahead of PTP (sending fast)
     const auto drift = rav::WrappingUint32(ptpTimestamp).diff(rav::WrappingUint32(rtpTimestamp_));
     
-    // If drift is too large, resync to PTP time
-    // This handles cases where the audio device sample rate doesn't exactly match
-    constexpr uint32_t kMaxDrift = 1024; // ~21ms at 48kHz
-    if (static_cast<uint32_t>(std::abs(drift)) > kMaxDrift)
+    // Resync to PTP time when drift exceeds threshold.
+    // 
+    // The threshold must balance two concerns:
+    // 1. Too small: causes frequent resyncs, which trigger SAC errors on receivers
+    // 2. Too large: allows drift to accumulate beyond receiver's playout buffer capacity
+    //
+    // AES67 receivers typically have 1-4ms playout buffers. We use 480 samples (10ms)
+    // as a threshold - this is:
+    // - Large enough to absorb jitter without constant resyncing
+    // - Small enough to stay within receiver tolerance before drift causes buffer problems
+    //
+    // Note: Audio device clocks typically drift 20-100 ppm from PTP. At 50 ppm:
+    // - Drift rate: ~2.4 samples/second
+    // - Time to reach 480 samples: ~200 seconds (3+ minutes)
+    // So resyncs should be infrequent, but happen before receiver buffer issues occur.
+    constexpr int32_t kMaxDrift = 480;  // 10ms at 48kHz
+    if (std::abs(drift) > kMaxDrift)
     {
+        // Drift exceeded threshold - resync timestamp to PTP time
+        // This may cause a small glitch but prevents accumulating drift that
+        // would cause receiver buffer overflow/underflow
         rtpTimestamp_ = ptpTimestamp;
-    }
-    else
-    {
-        // Use PTP-synced timestamp, but only if it's ahead of our current timestamp
-        // This ensures we don't send packets with timestamps in the past
-        if (ptpTimestamp >= rtpTimestamp_)
-        {
-            rtpTimestamp_ = ptpTimestamp;
-        }
     }
     
     // Create audio buffer view from float data
@@ -649,7 +657,7 @@ bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
     const float* channels[] = { audioData };
     rav::AudioBufferView<const float> bufferView(channels, kNumChannels, static_cast<size_t>(numSamples));
     
-    // Send audio data with PTP-synced RTP timestamp to the first active sender
+    // Send audio data with linearly advancing RTP timestamp to the first active sender
     if (activeSenders_.empty() || !activeSenders_[0].id.is_valid())
     {
         return false;
@@ -909,4 +917,5 @@ rav::RavennaSender::Configuration RavennaNodeManager::createSenderConfig(size_t 
 // (createAllSenders removed - senders are now created on demand)
 
 } // namespace AudioApp
+
 
