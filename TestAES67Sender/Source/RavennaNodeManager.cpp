@@ -16,6 +16,9 @@
 #include <fstream>
 #include <chrono>
 #include <cstdlib>
+#include <iomanip>
+#include <algorithm>
+#include <array>
 
 // #region agent log
 #define DEBUG_LOG(loc, msg, data) do { \
@@ -122,6 +125,29 @@ std::string RavennaNodeManager::getSenderDiagnostics() const
     ss << "Active: " << (isActive_.load() ? "Yes" : "No") << "\n";
     ss << "Senders: " << activeSenders_.size() << "\n";
     ss << "NMOS port: " << nmosPort_ << "\n";
+    
+    // Sender buffering / pacing monitoring
+    if (isActive_.load())
+    {
+        std::lock_guard<std::mutex> lock(sendStatsMutex_);
+
+        auto runtime = std::chrono::steady_clock::now() - sendStats_.startTime;
+        auto runtimeSecs = std::chrono::duration_cast<std::chrono::seconds>(runtime).count();
+        const int hours = static_cast<int>(runtimeSecs / 3600);
+        const int mins = static_cast<int>((runtimeSecs % 3600) / 60);
+        const int secs = static_cast<int>(runtimeSecs % 60);
+
+        ss << "\n--- SENDER PACING / ELASTIC BUFFER ---\n";
+        ss << "Runtime: " << hours << "h " << mins << "m " << secs << "s\n";
+        ss << "Packet time: 1ms (" << kFramesPerPacket << " frames)\n";
+        ss << "Target latency: " << kSenderLatencyMs << " ms (" << kTargetFifoLevel << " frames)\n";
+        ss << "FIFO: " << sendStats_.fifoLevel << " / " << sendStats_.fifoCapacity << " frames";
+        ss << " (error=" << sendStats_.lastError << ")\n";
+        ss << "Sent: " << sendStats_.sentPackets << " packets (" << sendStats_.sentFrames << " frames)\n";
+        ss << "Elastic adjust: drops=" << sendStats_.drops << ", dups=" << sendStats_.dups << "\n";
+        ss << "Underflows: " << sendStats_.underflows << "\n";
+        ss << "Overflows: " << sendStats_.overflows << "\n";
+    }
 
     for (size_t i = 0; i < activeSenders_.size(); ++i)
     {
@@ -509,7 +535,12 @@ bool RavennaNodeManager::start(const std::string& sessionName)
     instance.enabled = true;
     activeSenders_.push_back(instance);
     isActive_ = true;
+    
+    // Initialize RTP timestamp from PTP clock (we will add sender-side latency in send thread)
     rtpTimestamp_ = ptpSubscriber_ ? ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate) : 0;
+
+    // Start sender-side FIFO + paced packetization thread
+    startSendThread();
     
     // #region agent log
     DEBUG_LOG("RavennaNodeManager.cpp:start:success", "Sender created and enabled", "{\"senderId\":\"" + instance.id.to_string() + "\"}");
@@ -524,6 +555,9 @@ void RavennaNodeManager::stop()
     {
         return;
     }
+
+    // Stop sender thread first (it may call into node_)
+    stopSendThread();
     
     // #region agent log
     DEBUG_LOG("RavennaNodeManager.cpp:stop:entry", "Stopping RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numActive\":" + std::to_string(activeSenders_.size()) + "}");
@@ -555,6 +589,9 @@ void RavennaNodeManager::shutdown()
     {
         return;
     }
+
+    // Stop sender thread first (it may call into node_)
+    stopSendThread();
     
     // #region agent log
     DEBUG_LOG("RavennaNodeManager.cpp:shutdown:entry", "Shutting down RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numActive\":" + std::to_string(activeSenders_.size()) + "}");
@@ -610,68 +647,225 @@ bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
     {
         return false;
     }
-    
-    // Check if PTP is synchronized before sending
-    if (!isPtpSynchronized())
+
+    // Producer side: enqueue audio into FIFO. Packetization/sending is done from send thread.
+    const auto written = fifoWriteSamples(audioData, static_cast<uint32_t>(numSamples));
+    if (written < static_cast<uint32_t>(numSamples))
     {
-        // PTP not synchronized yet, don't send audio
+        fifoOverflows_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    
-    // Get PTP clock and convert to RTP timestamp
-    const auto& clock = ptpSubscriber_->get_local_clock();
-    const auto ptpTimestamp = clock.now().to_rtp_timestamp32(kSampleRate);
-    
-    // Calculate drift between PTP time and our current RTP timestamp using wrapping arithmetic
-    // Positive drift means PTP is ahead of our RTP timestamp (we're behind / sending slow)
-    // Negative drift means we're ahead of PTP (sending fast)
-    const auto drift = rav::WrappingUint32(ptpTimestamp).diff(rav::WrappingUint32(rtpTimestamp_));
-    
-    // Resync to PTP time when drift exceeds threshold.
-    // 
-    // The threshold must balance two concerns:
-    // 1. Too small: causes frequent resyncs, which trigger SAC errors on receivers
-    // 2. Too large: allows drift to accumulate beyond receiver's playout buffer capacity
-    //
-    // AES67 receivers typically have 1-4ms playout buffers. We use 480 samples (10ms)
-    // as a threshold - this is:
-    // - Large enough to absorb jitter without constant resyncing
-    // - Small enough to stay within receiver tolerance before drift causes buffer problems
-    //
-    // Note: Audio device clocks typically drift 20-100 ppm from PTP. At 50 ppm:
-    // - Drift rate: ~2.4 samples/second
-    // - Time to reach 480 samples: ~200 seconds (3+ minutes)
-    // So resyncs should be infrequent, but happen before receiver buffer issues occur.
-    constexpr int32_t kMaxDrift = 480;  // 10ms at 48kHz
-    if (std::abs(drift) > kMaxDrift)
-    {
-        // Drift exceeded threshold - resync timestamp to PTP time
-        // This may cause a small glitch but prevents accumulating drift that
-        // would cause receiver buffer overflow/underflow
-        rtpTimestamp_ = ptpTimestamp;
-    }
-    
-    // Create audio buffer view from float data
-    // Note: ravennakit expects float samples in range [-1.0, 1.0]
-    // AudioBufferView expects an array of channel pointers
-    const float* channels[] = { audioData };
-    rav::AudioBufferView<const float> bufferView(channels, kNumChannels, static_cast<size_t>(numSamples));
-    
-    // Send audio data with linearly advancing RTP timestamp to the first active sender
-    if (activeSenders_.empty() || !activeSenders_[0].id.is_valid())
-    {
-        return false;
-    }
-    
-    if (!node_->send_audio_data_realtime(activeSenders_[0].id, bufferView, rtpTimestamp_))
-    {
-        return false;
-    }
-    
-    // Increment RTP timestamp by number of samples sent
-    rtpTimestamp_ += static_cast<uint32_t>(numSamples);
-    
     return true;
+}
+
+uint32_t RavennaNodeManager::fifoLevel() const
+{
+    const auto w = fifoWrite_.load(std::memory_order_acquire);
+    const auto r = fifoRead_.load(std::memory_order_acquire);
+    const auto avail = (w >= r) ? (w - r) : 0;
+    return static_cast<uint32_t>(std::min<uint64_t>(avail, static_cast<uint64_t>(fifo_.size())));
+}
+
+uint32_t RavennaNodeManager::fifoWriteSamples(const float* data, uint32_t n)
+{
+    if (fifo_.empty() || fifoMask_ == 0 || n == 0)
+        return 0;
+
+    const auto w = fifoWrite_.load(std::memory_order_relaxed);
+    const auto r = fifoRead_.load(std::memory_order_acquire);
+    const uint64_t used = (w >= r) ? (w - r) : 0;
+    const uint64_t cap = static_cast<uint64_t>(fifo_.size());
+    const uint64_t free = (used >= cap) ? 0 : (cap - used);
+    const uint32_t toWrite = static_cast<uint32_t>(std::min<uint64_t>(free, n));
+
+    for (uint32_t i = 0; i < toWrite; ++i)
+        fifo_[(w + i) & fifoMask_] = data[i];
+
+    fifoWrite_.store(w + toWrite, std::memory_order_release);
+    return toWrite;
+}
+
+uint32_t RavennaNodeManager::fifoReadSamples(float* dst, uint32_t n)
+{
+    if (fifo_.empty() || fifoMask_ == 0 || n == 0)
+        return 0;
+
+    const auto r = fifoRead_.load(std::memory_order_relaxed);
+    const auto w = fifoWrite_.load(std::memory_order_acquire);
+    const uint64_t avail = (w >= r) ? (w - r) : 0;
+    const uint32_t toRead = static_cast<uint32_t>(std::min<uint64_t>(avail, n));
+
+    for (uint32_t i = 0; i < toRead; ++i)
+        dst[i] = fifo_[(r + i) & fifoMask_];
+
+    fifoRead_.store(r + toRead, std::memory_order_release);
+    return toRead;
+}
+
+void RavennaNodeManager::startSendThread()
+{
+    stopSendThread();
+
+    fifo_.assign(kFifoCapacityFrames, 0.0f);
+    fifoMask_ = fifo_.size() - 1;
+    fifoWrite_.store(0, std::memory_order_release);
+    fifoRead_.store(0, std::memory_order_release);
+    fifoOverflows_.store(0, std::memory_order_release);
+    elasticAcc_ = 0.0;
+    lastSample_ = 0.0f;
+
+    {
+        std::lock_guard<std::mutex> lock(sendStatsMutex_);
+        sendStats_ = SendStats{};
+        sendStats_.startTime = std::chrono::steady_clock::now();
+        sendStats_.fifoCapacity = static_cast<uint32_t>(fifo_.size());
+        sendStats_.fifoLevel = 0;
+        sendStats_.targetLevel = kTargetFifoLevel;
+    }
+
+    sendThreadRunning_.store(true, std::memory_order_release);
+    sendThread_ = std::thread([this] { sendThreadMain(); });
+}
+
+void RavennaNodeManager::stopSendThread()
+{
+    const bool wasRunning = sendThreadRunning_.exchange(false, std::memory_order_acq_rel);
+    if (wasRunning && sendThread_.joinable())
+        sendThread_.join();
+}
+
+void RavennaNodeManager::sendThreadMain()
+{
+    auto nextWake = std::chrono::steady_clock::now();
+
+    std::array<float, kFramesPerPacket + 1> in {};   // consume max = 49
+    std::array<float, kFramesPerPacket> out {};
+
+    bool timestampInitialized = false;
+
+    while (sendThreadRunning_.load(std::memory_order_acquire))
+    {
+        nextWake += std::chrono::milliseconds(1);
+
+        if (!isActive() || !ptpSubscriber_ || !ptpSubscriber_->get_local_clock().is_calibrated())
+        {
+            std::this_thread::sleep_until(nextWake);
+            continue;
+        }
+
+        if (activeSenders_.empty() || !activeSenders_[0].id.is_valid())
+        {
+            std::this_thread::sleep_until(nextWake);
+            continue;
+        }
+
+        if (!timestampInitialized)
+        {
+            // Warm-up: wait until we have enough buffered audio to hit our target sender latency.
+            // This avoids startup underflows (which can cause audible ticks).
+            if (fifoLevel() < kTargetFifoLevel)
+            {
+                std::this_thread::sleep_until(nextWake);
+                continue;
+            }
+
+            const auto nowTs = ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate);
+            rtpTimestamp_ = nowTs + kTargetFifoLevel; // stamp packets kSenderLatencyMs into the future
+            timestampInitialized = true;
+        }
+
+        const uint32_t level = fifoLevel();
+        const int32_t error = static_cast<int32_t>(level) - static_cast<int32_t>(kTargetFifoLevel);
+
+        // Elastic control: convert FIFO level error into occasional +/-1 sample decisions.
+        // A "drop" consumes 49 input samples but outputs 48 (speeds up slightly).
+        // A "dup" consumes 47 input samples but outputs 48 (slows down slightly).
+        constexpr double kP = 1.0 / 2000.0; // tune: higher -> tighter level, more frequent adjustments
+        elasticAcc_ += static_cast<double>(error) * kP;
+
+        int32_t delta = 0;
+        if (elasticAcc_ >= 1.0)
+        {
+            delta = +1;
+            elasticAcc_ -= 1.0;
+        }
+        else if (elasticAcc_ <= -1.0)
+        {
+            delta = -1;
+            elasticAcc_ += 1.0;
+        }
+
+        const int32_t consumeI = static_cast<int32_t>(kFramesPerPacket) + delta;
+        const uint32_t consume = static_cast<uint32_t>(std::clamp<int32_t>(consumeI, static_cast<int32_t>(kFramesPerPacket - 1), static_cast<int32_t>(kFramesPerPacket + 1)));
+        const uint32_t got = fifoReadSamples(in.data(), consume);
+
+        bool underflow = false;
+        if (got < consume)
+        {
+            underflow = true;
+            for (uint32_t i = got; i < consume; ++i)
+                in[i] = lastSample_;
+        }
+
+        if (consume == kFramesPerPacket)
+        {
+            // Normal case: 48 -> 48
+            for (uint32_t i = 0; i < kFramesPerPacket; ++i)
+                out[i] = in[i];
+        }
+        else
+        {
+            // Smooth elastic correction:
+            // - "drop" case: 49 input samples -> 48 output samples (slight speed-up)
+            // - "dup" case: 47 input samples -> 48 output samples (slight slow-down)
+            //
+            // Instead of hard skip/repeat (which creates phase discontinuities and clicks on sine waves),
+            // we do a tiny time-stretch/compress on this 1ms block using linear interpolation.
+            const double inLast = static_cast<double>(consume - 1);
+            const double outLast = static_cast<double>(kFramesPerPacket - 1);
+            const double ratio = inLast / outLast;
+
+            for (uint32_t i = 0; i < kFramesPerPacket; ++i)
+            {
+                const double pos = static_cast<double>(i) * ratio;
+                const uint32_t idx = static_cast<uint32_t>(pos);
+                const double frac = pos - static_cast<double>(idx);
+
+                if (idx + 1u >= consume)
+                {
+                    out[i] = in[consume - 1];
+                }
+                else
+                {
+                    const float a = in[idx];
+                    const float b = in[idx + 1u];
+                    out[i] = static_cast<float>(a + (b - a) * static_cast<float>(frac));
+                }
+            }
+        }
+
+        lastSample_ = out[kFramesPerPacket - 1];
+
+        const float* channels[] = { out.data() };
+        rav::AudioBufferView<const float> bufferView(channels, kNumChannels, static_cast<size_t>(kFramesPerPacket));
+
+        (void)node_->send_audio_data_realtime(activeSenders_[0].id, bufferView, rtpTimestamp_);
+        rtpTimestamp_ += kFramesPerPacket;
+
+        {
+            std::lock_guard<std::mutex> lock(sendStatsMutex_);
+            sendStats_.fifoLevel = level;
+            sendStats_.lastError = error;
+            sendStats_.sentPackets++;
+            sendStats_.sentFrames += kFramesPerPacket;
+            sendStats_.overflows = fifoOverflows_.load(std::memory_order_relaxed);
+            if (delta == +1) sendStats_.drops++;
+            if (delta == -1) sendStats_.dups++;
+            if (underflow) sendStats_.underflows++;
+        }
+
+        std::this_thread::sleep_until(nextWake);
+    }
 }
 
 std::vector<std::string> RavennaNodeManager::getAvailableInterfaces() const

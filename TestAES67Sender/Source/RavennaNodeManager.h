@@ -15,6 +15,7 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 namespace AudioApp
 {
@@ -234,6 +235,40 @@ private:
     
     // RTP timestamp tracking
     uint32_t rtpTimestamp_;
+
+    // Sender-side buffering / pacing
+    // We enqueue audio from the JUCE callback and send fixed 1ms packets from a dedicated thread.
+    // Clock drift is handled by an "elastic buffer" (occasional single-sample drop/dup),
+    // rather than manipulating RTP timestamps (which would create discontinuities).
+    std::thread sendThread_;
+    std::atomic<bool> sendThreadRunning_{false};
+
+    // SPSC ring buffer (audio thread producer, send thread consumer)
+    std::vector<float> fifo_;
+    size_t fifoMask_{0}; // capacity must be power of two; mask = capacity-1
+    std::atomic<uint64_t> fifoWrite_{0};
+    std::atomic<uint64_t> fifoRead_{0};
+    std::atomic<uint32_t> fifoOverflows_{0};
+
+    // Elastic buffer control
+    double elasticAcc_{0.0};        // accumulator for drop/dup decisions
+    float lastSample_{0.0f};        // last sample used for underflow fill / dup
+
+    // Monitoring stats for UI
+    mutable std::mutex sendStatsMutex_;
+    struct SendStats {
+        std::chrono::steady_clock::time_point startTime{std::chrono::steady_clock::now()};
+        uint32_t fifoCapacity{0};
+        uint32_t fifoLevel{0};
+        uint32_t targetLevel{0};
+        uint64_t sentPackets{0};
+        uint64_t sentFrames{0};
+        uint32_t drops{0};          // number of single-sample drops performed
+        uint32_t dups{0};           // number of single-sample dups performed
+        uint32_t underflows{0};     // number of times we didn't have enough samples
+        uint32_t overflows{0};      // number of times producer overflowed fifo
+        int32_t lastError{0};       // fifoLevel - targetLevel (samples)
+    } sendStats_;
     
     // NMOS port
     uint16_t nmosPort_{0};
@@ -255,6 +290,20 @@ private:
     static constexpr uint32_t kSampleRate = 48000;
     static constexpr rav::AudioEncoding kEncoding = rav::AudioEncoding::pcm_s24;
     static constexpr uint32_t kNumChannels = 1; // Mono
+
+    // Sender pacing config
+    static constexpr uint32_t kFramesPerPacket = 48;      // 1ms at 48kHz (matches PacketTime::ms_1())
+    static constexpr uint32_t kSenderLatencyMs = 50;      // sender-side buffering target
+    static constexpr uint32_t kTargetFifoLevel = kFramesPerPacket * kSenderLatencyMs; // in samples/frames
+    static constexpr uint32_t kFifoCapacityFrames = 1u << 16; // 65536 frames (~1.36s) power-of-two
+
+    void startSendThread();
+    void stopSendThread();
+    void sendThreadMain();
+    uint32_t fifoLevel() const;
+    uint32_t fifoCapacity() const { return static_cast<uint32_t>(fifo_.size()); }
+    uint32_t fifoWriteSamples(const float* data, uint32_t n);
+    uint32_t fifoReadSamples(float* dst, uint32_t n);
     
     // Helper methods
     boost::asio::ip::address_v4 generateMulticastAddress(size_t senderIndex);
