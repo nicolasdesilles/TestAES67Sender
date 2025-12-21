@@ -20,6 +20,10 @@
 #include <algorithm>
 #include <array>
 
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
+
 // #region agent log
 #define DEBUG_LOG(loc, msg, data) do { \
     std::ofstream logFile("/Users/nicolasdesilles/Desktop/TestAES67Sender/.cursor/debug.log", std::ios::app); \
@@ -137,15 +141,18 @@ std::string RavennaNodeManager::getSenderDiagnostics() const
         const int mins = static_cast<int>((runtimeSecs % 3600) / 60);
         const int secs = static_cast<int>(runtimeSecs % 60);
 
-        ss << "\n--- SENDER PACING / ELASTIC BUFFER ---\n";
+        ss << "\n--- SENDER PACING / ASRC ---\n";
         ss << "Runtime: " << hours << "h " << mins << "m " << secs << "s\n";
         ss << "Packet time: 1ms (" << kFramesPerPacket << " frames)\n";
         ss << "Target latency: " << kSenderLatencyMs << " ms (" << kTargetFifoLevel << " frames)\n";
-        ss << "FIFO: " << sendStats_.fifoLevel << " / " << sendStats_.fifoCapacity << " frames";
-        ss << " (error=" << sendStats_.lastError << ")\n";
+        ss << "Buffered: " << sendStats_.fifoLevel << " frames (error=" << sendStats_.lastError << ")\n";
+        ss << "  fifo=" << sendStats_.fifoOnly << "  asrc=" << sendStats_.asrcOnly << "  fifo_cap=" << sendStats_.fifoCapacity << "\n";
         ss << "Sent: " << sendStats_.sentPackets << " packets (" << sendStats_.sentFrames << " frames)\n";
-        ss << "Elastic adjust: drops=" << sendStats_.drops << ", dups=" << sendStats_.dups << "\n";
+        ss << "ASRC ratio: " << std::fixed << std::setprecision(1) << sendStats_.ratioPpm << " ppm";
+        ss << " (min=" << sendStats_.ratioPpmMin << ", max=" << sendStats_.ratioPpmMax << ")\n";
         ss << "Underflows: " << sendStats_.underflows << "\n";
+        ss << "PTP warmup skips: " << sendStats_.ptpNotCalibratedSkips << "\n";
+        ss << "Deadline misses: " << sendStats_.deadlineMisses << "\n";
         ss << "Overflows: " << sendStats_.overflows << "\n";
     }
 
@@ -711,8 +718,10 @@ void RavennaNodeManager::startSendThread()
     fifoWrite_.store(0, std::memory_order_release);
     fifoRead_.store(0, std::memory_order_release);
     fifoOverflows_.store(0, std::memory_order_release);
-    elasticAcc_ = 0.0;
     lastSample_ = 0.0f;
+
+    buildSincTable();
+    asrcReset();
 
     {
         std::lock_guard<std::mutex> lock(sendStatsMutex_);
@@ -721,6 +730,9 @@ void RavennaNodeManager::startSendThread()
         sendStats_.fifoCapacity = static_cast<uint32_t>(fifo_.size());
         sendStats_.fifoLevel = 0;
         sendStats_.targetLevel = kTargetFifoLevel;
+        sendStats_.ratioPpm = 0.0;
+        sendStats_.ratioPpmMin = 0.0;
+        sendStats_.ratioPpmMax = 0.0;
     }
 
     sendThreadRunning_.store(true, std::memory_order_release);
@@ -736,18 +748,34 @@ void RavennaNodeManager::stopSendThread()
 
 void RavennaNodeManager::sendThreadMain()
 {
+#ifdef __APPLE__
+    // Best-effort: increase scheduling QoS to reduce wakeup jitter.
+    // If this fails, we still function; it just increases the risk of late wakes.
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+
     auto nextWake = std::chrono::steady_clock::now();
 
-    std::array<float, kFramesPerPacket + 1> in {};   // consume max = 49
     std::array<float, kFramesPerPacket> out {};
 
     bool timestampInitialized = false;
+    uint32_t ptpWarmupSkips = 0;
+    uint32_t deadlineMisses = 0;
 
     while (sendThreadRunning_.load(std::memory_order_acquire))
     {
         nextWake += std::chrono::milliseconds(1);
 
-        if (!isActive() || !ptpSubscriber_ || !ptpSubscriber_->get_local_clock().is_calibrated())
+        // Deadline monitoring: detect if we woke up late (OS scheduling hiccup).
+        const auto now = std::chrono::steady_clock::now();
+        if (now > nextWake + std::chrono::milliseconds(2))
+        {
+            deadlineMisses++;
+            // Don't try to "catch up" by sending bursts; just re-align schedule.
+            nextWake = now;
+        }
+
+        if (!isActive() || !ptpSubscriber_)
         {
             std::this_thread::sleep_until(nextWake);
             continue;
@@ -759,12 +787,25 @@ void RavennaNodeManager::sendThreadMain()
             continue;
         }
 
+        const uint32_t fifoLvl = fifoLevel();
+        const uint32_t asrcLvl = asrcBufferedFrames();
+        const uint32_t totalBuffered = fifoLvl + asrcLvl;
+
         if (!timestampInitialized)
         {
-            // Warm-up: wait until we have enough buffered audio to hit our target sender latency.
-            // This avoids startup underflows (which can cause audible ticks).
-            if (fifoLevel() < kTargetFifoLevel)
+            if (!ptpSubscriber_->get_local_clock().is_calibrated())
             {
+                ptpWarmupSkips++;
+                std::this_thread::sleep_until(nextWake);
+                continue;
+            }
+
+            // Warm-up: wait until TOTAL buffered audio reaches our target sender latency.
+            // (FIFO may be low if ASRC ring already holds samples.)
+            if (totalBuffered < (kTargetFifoLevel + kSincTaps))
+            {
+                // Keep ASRC topped up to avoid underflows once we start.
+                (void)asrcFillFromFifo(kTargetFifoLevel + kSincTaps + kFramesPerPacket * 2, 512);
                 std::this_thread::sleep_until(nextWake);
                 continue;
             }
@@ -774,74 +815,42 @@ void RavennaNodeManager::sendThreadMain()
             timestampInitialized = true;
         }
 
-        const uint32_t level = fifoLevel();
-        const int32_t error = static_cast<int32_t>(level) - static_cast<int32_t>(kTargetFifoLevel);
+        // Control on TOTAL buffered audio, not just FIFO.
+        // This keeps end-to-end sender latency near kSenderLatencyMs instead of filling the ASRC ring.
+        const int32_t error = static_cast<int32_t>(totalBuffered) - static_cast<int32_t>(kTargetFifoLevel);
 
-        // Elastic control: convert FIFO level error into occasional +/-1 sample decisions.
-        // A "drop" consumes 49 input samples but outputs 48 (speeds up slightly).
-        // A "dup" consumes 47 input samples but outputs 48 (slows down slightly).
-        constexpr double kP = 1.0 / 2000.0; // tune: higher -> tighter level, more frequent adjustments
-        elasticAcc_ += static_cast<double>(error) * kP;
+        // Continuous ASRC (PI controller on FIFO error).
+        // ratio > 1 consumes more input per output -> FIFO level decreases
+        // ratio < 1 consumes less input per output -> FIFO level increases
+        //
+        // We keep ratio changes very small and smooth to avoid audible modulation.
+        constexpr double kP = 1.0 / 2'000'000.0;  // proportional gain (per-sample error -> ratio)
+        constexpr double kI = 1.0 / 50'000'000.0; // integral gain
+        constexpr double kMaxPpm = 2000.0;        // clamp ratio within +/- 2000 ppm
+        constexpr double kRatioSmoothing = 0.01;  // smooth ratio to avoid jitter
 
-        int32_t delta = 0;
-        if (elasticAcc_ >= 1.0)
-        {
-            delta = +1;
-            elasticAcc_ -= 1.0;
-        }
-        else if (elasticAcc_ <= -1.0)
-        {
-            delta = -1;
-            elasticAcc_ += 1.0;
-        }
+        ratioIntegral_ += static_cast<double>(error) * kI;
+        ratioIntegral_ = std::clamp(ratioIntegral_, -kMaxPpm * 1e-6, kMaxPpm * 1e-6);
 
-        const int32_t consumeI = static_cast<int32_t>(kFramesPerPacket) + delta;
-        const uint32_t consume = static_cast<uint32_t>(std::clamp<int32_t>(consumeI, static_cast<int32_t>(kFramesPerPacket - 1), static_cast<int32_t>(kFramesPerPacket + 1)));
-        const uint32_t got = fifoReadSamples(in.data(), consume);
+        ratio_ = 1.0 + static_cast<double>(error) * kP + ratioIntegral_;
+        ratio_ = std::clamp(ratio_, 1.0 - kMaxPpm * 1e-6, 1.0 + kMaxPpm * 1e-6);
+        ratioSmoothed_ += (ratio_ - ratioSmoothed_) * kRatioSmoothing;
+
+        // Keep ASRC ring at a small headroom above target (avoid underflow, avoid huge latency)
+        constexpr uint32_t kAsrcHeadroom = kSincTaps + (kFramesPerPacket * 4); // ~ a few ms + taps
+        (void)asrcFillFromFifo(kTargetFifoLevel + kAsrcHeadroom, 512);
 
         bool underflow = false;
-        if (got < consume)
+        // Generate exactly 48 output samples with bandlimited interpolation
+        for (uint32_t i = 0; i < kFramesPerPacket; ++i)
         {
-            underflow = true;
-            for (uint32_t i = got; i < consume; ++i)
-                in[i] = lastSample_;
-        }
-
-        if (consume == kFramesPerPacket)
-        {
-            // Normal case: 48 -> 48
-            for (uint32_t i = 0; i < kFramesPerPacket; ++i)
-                out[i] = in[i];
-        }
-        else
-        {
-            // Smooth elastic correction:
-            // - "drop" case: 49 input samples -> 48 output samples (slight speed-up)
-            // - "dup" case: 47 input samples -> 48 output samples (slight slow-down)
-            //
-            // Instead of hard skip/repeat (which creates phase discontinuities and clicks on sine waves),
-            // we do a tiny time-stretch/compress on this 1ms block using linear interpolation.
-            const double inLast = static_cast<double>(consume - 1);
-            const double outLast = static_cast<double>(kFramesPerPacket - 1);
-            const double ratio = inLast / outLast;
-
-            for (uint32_t i = 0; i < kFramesPerPacket; ++i)
-            {
-                const double pos = static_cast<double>(i) * ratio;
-                const uint32_t idx = static_cast<uint32_t>(pos);
-                const double frac = pos - static_cast<double>(idx);
-
-                if (idx + 1u >= consume)
-                {
-                    out[i] = in[consume - 1];
-                }
-                else
-                {
-                    const float a = in[idx];
-                    const float b = in[idx + 1u];
-                    out[i] = static_cast<float>(a + (b - a) * static_cast<float>(frac));
-                }
-            }
+            const float y = asrcResampleOne(ratioSmoothed_);
+            out[i] = y;
+            lastSample_ = y;
+            // asrcResampleOne() returns lastSample_ on underflow; detect it conservatively
+            // by checking if we are reusing lastSample_ AND we're short on buffered ASRC data.
+            if (!underflow && asrcWrite_ < (asrcRead_ + static_cast<uint64_t>(kSincTaps) + 4))
+                underflow = true;
         }
 
         lastSample_ = out[kFramesPerPacket - 1];
@@ -854,18 +863,188 @@ void RavennaNodeManager::sendThreadMain()
 
         {
             std::lock_guard<std::mutex> lock(sendStatsMutex_);
-            sendStats_.fifoLevel = level;
+            sendStats_.fifoLevel = totalBuffered;
+            sendStats_.fifoOnly = fifoLvl;
+            sendStats_.asrcOnly = asrcLvl;
             sendStats_.lastError = error;
             sendStats_.sentPackets++;
             sendStats_.sentFrames += kFramesPerPacket;
             sendStats_.overflows = fifoOverflows_.load(std::memory_order_relaxed);
-            if (delta == +1) sendStats_.drops++;
-            if (delta == -1) sendStats_.dups++;
             if (underflow) sendStats_.underflows++;
+            sendStats_.ptpNotCalibratedSkips = ptpWarmupSkips;
+            sendStats_.deadlineMisses = deadlineMisses;
+            const double ppm = (ratioSmoothed_ - 1.0) * 1e6;
+            sendStats_.ratioPpm = ppm;
+            if (sendStats_.sentPackets == 1)
+            {
+                sendStats_.ratioPpmMin = ppm;
+                sendStats_.ratioPpmMax = ppm;
+            }
+            else
+            {
+                sendStats_.ratioPpmMin = std::min(sendStats_.ratioPpmMin, ppm);
+                sendStats_.ratioPpmMax = std::max(sendStats_.ratioPpmMax, ppm);
+            }
         }
 
         std::this_thread::sleep_until(nextWake);
     }
+}
+
+void RavennaNodeManager::buildSincTable()
+{
+    // Windowed-sinc lowpass filter table for fractional delay interpolation.
+    // We use a Kaiser window; cutoff < 1.0 to avoid imaging/aliasing near Nyquist.
+    constexpr double cutoff = 0.90;      // normalized (Nyquist=1.0)
+    constexpr double beta = 8.6;         // Kaiser beta (good stopband attenuation ~80dB)
+    constexpr double pi = 3.14159265358979323846;
+    const int taps = static_cast<int>(kSincTaps);
+    const int half = taps / 2;
+
+    auto besselI0 = [](double x) -> double {
+        // Approximation of modified Bessel function I0 (sufficient for window generation)
+        double sum = 1.0;
+        double y = x * x / 4.0;
+        double t = y;
+        for (int k = 1; k < 20; ++k)
+        {
+            sum += t;
+            t *= y / (static_cast<double>(k + 1) * static_cast<double>(k + 1));
+        }
+        return sum;
+    };
+
+    const double denom = besselI0(beta);
+    sincTable_.assign(kSincPhases * kSincTaps, 0.0f);
+
+    for (uint32_t p = 0; p < kSincPhases; ++p)
+    {
+        const double frac = static_cast<double>(p) / static_cast<double>(kSincPhases); // [0,1)
+        double sum = 0.0;
+
+        for (int i = 0; i < taps; ++i)
+        {
+            const int n = i - (half - 1); // symmetric around 0
+            const double x = static_cast<double>(n) - frac;
+
+            double sinc;
+            const double a = pi * x;
+            if (std::abs(a) < 1e-12)
+                sinc = 1.0;
+            else
+                sinc = std::sin(cutoff * a) / (cutoff * a);
+
+            // Kaiser window
+            const double r = static_cast<double>(i) / static_cast<double>(taps - 1); // 0..1
+            const double wArg = beta * std::sqrt(std::max(0.0, 1.0 - std::pow(2.0 * r - 1.0, 2.0)));
+            const double win = besselI0(wArg) / denom;
+
+            const double coeff = sinc * win * cutoff;
+            sincTable_[p * kSincTaps + static_cast<uint32_t>(i)] = static_cast<float>(coeff);
+            sum += coeff;
+        }
+
+        // Normalize gain at DC for each phase
+        const double inv = (sum != 0.0) ? (1.0 / sum) : 1.0;
+        for (uint32_t i = 0; i < kSincTaps; ++i)
+            sincTable_[p * kSincTaps + i] = static_cast<float>(static_cast<double>(sincTable_[p * kSincTaps + i]) * inv);
+    }
+}
+
+void RavennaNodeManager::asrcReset()
+{
+    asrcRing_.assign(kAsrcRingFrames, 0.0f);
+    asrcMask_ = asrcRing_.size() - 1;
+    asrcWrite_ = 0;
+    asrcRead_ = 0;
+    asrcFrac_ = 0.0;
+    ratio_ = 1.0;
+    ratioSmoothed_ = 1.0;
+    ratioIntegral_ = 0.0;
+    asrcTmp_.assign(512, 0.0f);
+}
+
+uint32_t RavennaNodeManager::asrcBufferedFrames() const
+{
+    const uint64_t used = (asrcWrite_ >= asrcRead_) ? (asrcWrite_ - asrcRead_) : 0;
+    return static_cast<uint32_t>(std::min<uint64_t>(used, static_cast<uint64_t>(asrcRing_.size())));
+}
+
+uint32_t RavennaNodeManager::asrcFillFromFifo(uint32_t desiredBufferedFrames, uint32_t maxFramesPerCall)
+{
+    if (asrcRing_.empty() || asrcMask_ == 0)
+        return 0;
+
+    const uint64_t buffered = (asrcWrite_ >= asrcRead_) ? (asrcWrite_ - asrcRead_) : 0;
+    if (buffered >= desiredBufferedFrames)
+        return 0;
+
+    const uint64_t need = static_cast<uint64_t>(desiredBufferedFrames) - buffered;
+
+    // Free space (leave at least kSincTaps + 4 samples to avoid overwrite of history)
+    const uint64_t cap = static_cast<uint64_t>(asrcRing_.size());
+    const uint64_t used = (asrcWrite_ >= asrcRead_) ? (asrcWrite_ - asrcRead_) : 0;
+    const uint64_t free = (used >= cap) ? 0 : (cap - used);
+    const uint32_t toPull = static_cast<uint32_t>(
+        std::min<uint64_t>(std::min<uint64_t>(std::min<uint64_t>(free, need), maxFramesPerCall), 4096)
+    );
+    if (toPull == 0)
+        return 0;
+
+    if (asrcTmp_.size() < toPull)
+        asrcTmp_.resize(toPull);
+
+    const uint32_t got = fifoReadSamples(asrcTmp_.data(), toPull);
+
+    for (uint32_t i = 0; i < got; ++i)
+    {
+        asrcRing_[(asrcWrite_ + i) & asrcMask_] = asrcTmp_[i];
+    }
+    asrcWrite_ += got;
+    return got;
+}
+
+float RavennaNodeManager::asrcGetSample(uint64_t idx) const
+{
+    return asrcRing_[idx & asrcMask_];
+}
+
+float RavennaNodeManager::asrcResampleOne(double ratio)
+{
+    // Ensure we have enough samples ahead: read position plus taps + a couple of samples.
+    // If not, return lastSample_ (underflow concealment).
+    const uint64_t needAhead = asrcRead_ + static_cast<uint64_t>(kSincTaps) + 4;
+    if (asrcWrite_ < needAhead)
+        return lastSample_;
+
+    // Phase index
+    const double frac = std::clamp(asrcFrac_, 0.0, 0.999999);
+    const uint32_t phase = static_cast<uint32_t>(frac * static_cast<double>(kSincPhases));
+    const uint32_t base = phase * kSincTaps;
+
+    const int taps = static_cast<int>(kSincTaps);
+    const int half = taps / 2;
+    const int centerOffset = half - 1;
+
+    double acc = 0.0;
+    for (int i = 0; i < taps; ++i)
+    {
+        const int n = i - centerOffset;
+        const uint64_t si = static_cast<uint64_t>(static_cast<int64_t>(asrcRead_) + n);
+        const float x = asrcGetSample(si);
+        const float c = sincTable_[base + static_cast<uint32_t>(i)];
+        acc += static_cast<double>(x) * static_cast<double>(c);
+    }
+
+    // Advance input position by ratio (input samples per output sample)
+    asrcFrac_ += ratio;
+    while (asrcFrac_ >= 1.0)
+    {
+        asrcFrac_ -= 1.0;
+        asrcRead_ += 1;
+    }
+
+    return static_cast<float>(acc);
 }
 
 std::vector<std::string> RavennaNodeManager::getAvailableInterfaces() const

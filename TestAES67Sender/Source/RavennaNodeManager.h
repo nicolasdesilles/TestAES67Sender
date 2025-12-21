@@ -251,23 +251,45 @@ private:
     std::atomic<uint32_t> fifoOverflows_{0};
 
     // Elastic buffer control
-    double elasticAcc_{0.0};        // accumulator for drop/dup decisions
-    float lastSample_{0.0f};        // last sample used for underflow fill / dup
+    float lastSample_{0.0f};        // last sample used for underflow fill
+
+    // Continuous ASRC (best quality): PI-controlled resampling ratio + polyphase windowed-sinc
+    static constexpr uint32_t kSincPhases = 1024;  // phase table resolution
+    static constexpr uint32_t kSincTaps = 64;      // filter taps (must be even)
+    std::vector<float> sincTable_;                 // [kSincPhases * kSincTaps]
+
+    // ASRC ring buffer (separate from FIFO to support fractional delay taps)
+    std::vector<float> asrcRing_;
+    size_t asrcMask_{0};
+    uint64_t asrcWrite_{0};        // absolute write index into ring
+    uint64_t asrcRead_{0};         // absolute integer read index into ring (floor position)
+    double asrcFrac_{0.0};         // fractional phase [0,1)
+    std::vector<float> asrcTmp_;   // scratch buffer to avoid per-tick heap allocations
+
+    // PI controller state (controls ratio = input_samples_per_output_sample)
+    double ratio_{1.0};
+    double ratioSmoothed_{1.0};
+    double ratioIntegral_{0.0};
 
     // Monitoring stats for UI
     mutable std::mutex sendStatsMutex_;
     struct SendStats {
         std::chrono::steady_clock::time_point startTime{std::chrono::steady_clock::now()};
         uint32_t fifoCapacity{0};
-        uint32_t fifoLevel{0};
+        uint32_t fifoLevel{0};      // total buffered frames (fifo + asrc)
+        uint32_t fifoOnly{0};       // fifo-only frames
+        uint32_t asrcOnly{0};       // asrc-ring buffered frames
         uint32_t targetLevel{0};
         uint64_t sentPackets{0};
         uint64_t sentFrames{0};
-        uint32_t drops{0};          // number of single-sample drops performed
-        uint32_t dups{0};           // number of single-sample dups performed
-        uint32_t underflows{0};     // number of times we didn't have enough samples
+        uint32_t underflows{0};     // sender underflows (ASRC did not have enough data; conceal with last sample)
+        uint32_t ptpNotCalibratedSkips{0}; // times we skipped sending because PTP wasn't calibrated during warmup
+        uint32_t deadlineMisses{0}; // times sender thread woke up late by > threshold
         uint32_t overflows{0};      // number of times producer overflowed fifo
         int32_t lastError{0};       // fifoLevel - targetLevel (samples)
+        double ratioPpm{0.0};       // current resample ratio in ppm (ratio-1)*1e6
+        double ratioPpmMin{0.0};
+        double ratioPpmMax{0.0};
     } sendStats_;
     
     // NMOS port
@@ -293,9 +315,10 @@ private:
 
     // Sender pacing config
     static constexpr uint32_t kFramesPerPacket = 48;      // 1ms at 48kHz (matches PacketTime::ms_1())
-    static constexpr uint32_t kSenderLatencyMs = 50;      // sender-side buffering target
+    static constexpr uint32_t kSenderLatencyMs = 10;      // sender-side buffering target
     static constexpr uint32_t kTargetFifoLevel = kFramesPerPacket * kSenderLatencyMs; // in samples/frames
     static constexpr uint32_t kFifoCapacityFrames = 1u << 16; // 65536 frames (~1.36s) power-of-two
+    static constexpr uint32_t kAsrcRingFrames = 1u << 15; // 32768 frames power-of-two (~0.68s)
 
     void startSendThread();
     void stopSendThread();
@@ -304,6 +327,13 @@ private:
     uint32_t fifoCapacity() const { return static_cast<uint32_t>(fifo_.size()); }
     uint32_t fifoWriteSamples(const float* data, uint32_t n);
     uint32_t fifoReadSamples(float* dst, uint32_t n);
+
+    void buildSincTable();
+    void asrcReset();
+    uint32_t asrcFillFromFifo(uint32_t desiredBufferedFrames, uint32_t maxFramesPerCall);
+    float asrcGetSample(uint64_t idx) const;
+    float asrcResampleOne(double ratio);
+    uint32_t asrcBufferedFrames() const;
     
     // Helper methods
     boost::asio::ip::address_v4 generateMulticastAddress(size_t senderIndex);
