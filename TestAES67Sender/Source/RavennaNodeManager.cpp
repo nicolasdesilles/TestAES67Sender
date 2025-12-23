@@ -970,7 +970,8 @@ void RavennaNodeManager::sendThreadMain()
 
                 if (totalBuffered < (kTargetFifoLevel + kSincTaps))
                 {
-                    (void)asrcFillFromFifo(p, kTargetFifoLevel + kSincTaps + kFramesPerPacket * 2, 512);
+                    // Allow a larger burst fill to quickly reach target buffering on startup / with callback jitter.
+                    (void)asrcFillFromFifo(p, kTargetFifoLevel + kSincTaps + kFramesPerPacket * 2, 4096);
                     continue;
                 }
 
@@ -994,7 +995,7 @@ void RavennaNodeManager::sendThreadMain()
             p.ratioSmoothed += (p.ratio - p.ratioSmoothed) * kRatioSmoothing;
 
             constexpr uint32_t kAsrcHeadroom = kSincTaps + (kFramesPerPacket * 4);
-            (void)asrcFillFromFifo(p, kTargetFifoLevel + kAsrcHeadroom, 512);
+            (void)asrcFillFromFifo(p, kTargetFifoLevel + kAsrcHeadroom, 4096);
 
             bool underflow = false;
             for (uint32_t i = 0; i < kFramesPerPacket; ++i)
@@ -1115,8 +1116,9 @@ void RavennaNodeManager::resetPipeline(SenderInstance::Pipeline& p)
 
     p.asrcRing.assign(kAsrcRingFrames, 0.0f);
     p.asrcMask = p.asrcRing.size() - 1;
-    p.asrcWrite = 0;
-    p.asrcRead = 0;
+    // Start read/write at kSincTaps so the interpolator never reads "before start" (prevents startup pops).
+    p.asrcWrite = kSincTaps;
+    p.asrcRead = kSincTaps;
     p.asrcFrac = 0.0;
     p.asrcTmp.assign(512, 0.0f);
 

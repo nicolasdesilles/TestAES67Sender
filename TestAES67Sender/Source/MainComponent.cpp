@@ -837,6 +837,10 @@ static std::unique_ptr<juce::WebInputStream> sendJsonRequest(const juce::String&
     if (!stream->connect(nullptr))
         return nullptr;
 
+    const int status = stream->getStatusCode();
+    if (status >= 400 || status == 0)
+        return nullptr;
+
     return stream;
 }
 
@@ -874,6 +878,9 @@ void MainComponent::onConnectReceiver()
     std::thread([safeThis, sender, receiver] {
         bool ok = false;
         juce::String error;
+#if JUCE_MAC
+        juce::ScopedAutoReleasePool pool;
+#endif
         try
         {
             auto staged = new juce::DynamicObject();
@@ -893,6 +900,9 @@ void MainComponent::onConnectReceiver()
             auto stream = sendJsonRequest(stagedUrl, "PATCH", stagedBody);
             if (!stream)
                 throw std::runtime_error("PATCH staged failed");
+            const int stagedStatus = stream->getStatusCode();
+            if (stagedStatus >= 400 || stagedStatus == 0)
+                throw std::runtime_error(("PATCH staged HTTP " + std::to_string(stagedStatus)).c_str());
 
             auto activateObj = new juce::DynamicObject();
             activateObj->setProperty("mode", "activate_immediate");
@@ -901,6 +911,9 @@ void MainComponent::onConnectReceiver()
             auto actStream = sendJsonRequest(activateUrl, "POST", activateBody);
             if (!actStream)
                 throw std::runtime_error("activate failed");
+            const int actStatus = actStream->getStatusCode();
+            if (actStatus >= 400 || actStatus == 0)
+                throw std::runtime_error(("activate HTTP " + std::to_string(actStatus)).c_str());
 
             ok = true;
         }
@@ -942,6 +955,9 @@ void MainComponent::onDisconnectReceiver()
     std::thread([safeThis, receiver] {
         bool ok = false;
         juce::String error;
+#if JUCE_MAC
+        juce::ScopedAutoReleasePool pool;
+#endif
         try
         {
             auto staged = new juce::DynamicObject();
@@ -954,6 +970,9 @@ void MainComponent::onDisconnectReceiver()
             auto stream = sendJsonRequest(stagedUrl, "PATCH", stagedBody);
             if (!stream)
                 throw std::runtime_error("PATCH staged failed");
+            const int stagedStatus = stream->getStatusCode();
+            if (stagedStatus >= 400 || stagedStatus == 0)
+                throw std::runtime_error(("PATCH staged HTTP " + std::to_string(stagedStatus)).c_str());
 
             auto activateObj = new juce::DynamicObject();
             activateObj->setProperty("mode", "activate_immediate");
@@ -962,6 +981,9 @@ void MainComponent::onDisconnectReceiver()
             auto act = sendJsonRequest(activateUrl, "POST", activateBody);
             if (!act)
                 throw std::runtime_error("activate failed");
+            const int actStatus = act->getStatusCode();
+            if (actStatus >= 400 || actStatus == 0)
+                throw std::runtime_error(("activate HTTP " + std::to_string(actStatus)).c_str());
 
             ok = true;
         }

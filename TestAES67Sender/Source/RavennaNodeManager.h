@@ -402,7 +402,9 @@ private:
 
     // Sender pacing config
     static constexpr uint32_t kFramesPerPacket = 48;      // 1ms at 48kHz (matches PacketTime::ms_1())
-    static constexpr uint32_t kSenderLatencyMs = 10;      // sender-side buffering target
+    // Default was 10ms; on macOS we can occasionally see >10ms scheduling/callback hiccups.
+    // Increase the target buffering so short hiccups don't drain the ASRC lookahead and trigger underflows.
+    static constexpr uint32_t kSenderLatencyMs = 20;      // sender-side buffering target
     static constexpr uint32_t kTargetFifoLevel = kFramesPerPacket * kSenderLatencyMs; // in samples/frames
     static constexpr uint32_t kFifoCapacityFrames = 1u << 16; // 65536 frames (~1.36s) power-of-two
     static constexpr uint32_t kAsrcRingFrames = 1u << 15; // 32768 frames power-of-two (~0.68s)
