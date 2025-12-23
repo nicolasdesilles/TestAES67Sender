@@ -9,6 +9,8 @@
 
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <boost/uuid/string_generator.hpp>
+#include <juce_core/juce_core.h>
 
 #include <thread>
 #include <cmath>
@@ -36,6 +38,84 @@
 
 namespace AudioApp
 {
+
+juce::File RavennaNodeManager::getNodeIdFile() const
+{
+    auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                   .getChildFile("TestAES67Sender");
+    if (!dir.exists())
+        (void)dir.createDirectory();
+    return dir.getChildFile("nmos_node_id.txt");
+}
+
+boost::uuids::uuid RavennaNodeManager::loadOrCreateNodeId()
+{
+    auto file = getNodeIdFile();
+    if (file.existsAsFile())
+    {
+        const auto text = file.loadFileAsString().trim();
+        if (text.isNotEmpty())
+        {
+            try
+            {
+                boost::uuids::string_generator gen;
+                return gen(text.toStdString());
+            }
+            catch (...)
+            {
+                // fallthrough to new id
+            }
+        }
+    }
+
+    const auto newId = boost::uuids::random_generator()();
+    persistNodeId(newId);
+    return newId;
+}
+
+void RavennaNodeManager::persistNodeId(const boost::uuids::uuid& id)
+{
+    auto file = getNodeIdFile();
+    (void)file.create();
+    file.replaceWithText(juce::String(boost::uuids::to_string(id)));
+}
+
+std::optional<std::pair<std::string, std::string>> RavennaNodeManager::resolveLocalNmosIdsForLabel(const std::string& label) const
+{
+    if (nmosPort_ == 0)
+        return std::nullopt;
+
+    const auto urlString = "http://127.0.0.1:" + std::to_string(nmosPort_) + "/x-nmos/node/v1.3/senders";
+    juce::URL url { juce::String(urlString) };
+    auto stream = url.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+                                            .withConnectionTimeoutMs(1000)
+                                            .withNumRedirectsToFollow(1));
+    if (!stream)
+        return std::nullopt;
+
+    auto text = stream->readEntireStreamAsString();
+    juce::var json = juce::JSON::parse(text);
+    if (!json.isArray())
+        return std::nullopt;
+
+    for (const auto& item : *json.getArray())
+    {
+        auto* obj = item.getDynamicObject();
+        if (!obj)
+            continue;
+        const auto idVar = obj->getProperty("id");
+        const auto flowVar = obj->getProperty("flow_id");
+        const auto labelVar = obj->getProperty("label");
+        if (labelVar.isString() && labelVar.toString().toStdString() == label)
+        {
+            if (idVar.isString() && flowVar.isString())
+            {
+                return std::make_pair(idVar.toString().toStdString(), flowVar.toString().toStdString());
+            }
+        }
+    }
+    return std::nullopt;
+}
 
 void RavennaNodeManager::NodeSubscriber::nmos_node_config_updated(const rav::nmos::Node::Configuration& config)
 {
@@ -122,6 +202,32 @@ std::string RavennaNodeManager::getNmosDiagnostics() const
     return out;
 }
 
+std::string RavennaNodeManager::getRegistryBaseUrl() const
+{
+    std::lock_guard<std::mutex> lock(nmosMutex_);
+
+    auto url = configuredRegistryAddress_;
+    if (url.empty())
+    {
+        if (!nmosRegistryInfo_.address.empty())
+        {
+            url = nmosRegistryInfo_.address;
+            const bool hasScheme = (url.find("://") != std::string::npos);
+            if (!hasScheme)
+                url = "http://" + url;
+
+            // If no explicit port in address, append discovered api_port when available
+            const auto schemePos = url.find("://");
+            const auto hostStart = (schemePos == std::string::npos) ? 0u : static_cast<unsigned>(schemePos + 3);
+            const auto hostPort = url.substr(hostStart);
+            const bool hasPort = (hostPort.find(':') != std::string::npos);
+            if (!hasPort && nmosRegistryInfo_.api_port != 0)
+                url += ":" + std::to_string(nmosRegistryInfo_.api_port);
+        }
+    }
+    return url;
+}
+
 std::string RavennaNodeManager::getSenderDiagnostics() const
 {
     std::stringstream ss;
@@ -129,32 +235,10 @@ std::string RavennaNodeManager::getSenderDiagnostics() const
     ss << "Active: " << (isActive_.load() ? "Yes" : "No") << "\n";
     ss << "Senders: " << activeSenders_.size() << "\n";
     ss << "NMOS port: " << nmosPort_ << "\n";
-    
-    // Sender buffering / pacing monitoring
-    if (isActive_.load())
-    {
-        std::lock_guard<std::mutex> lock(sendStatsMutex_);
 
-        auto runtime = std::chrono::steady_clock::now() - sendStats_.startTime;
-        auto runtimeSecs = std::chrono::duration_cast<std::chrono::seconds>(runtime).count();
-        const int hours = static_cast<int>(runtimeSecs / 3600);
-        const int mins = static_cast<int>((runtimeSecs % 3600) / 60);
-        const int secs = static_cast<int>(runtimeSecs % 60);
-
-        ss << "\n--- SENDER PACING / ASRC ---\n";
-        ss << "Runtime: " << hours << "h " << mins << "m " << secs << "s\n";
-        ss << "Packet time: 1ms (" << kFramesPerPacket << " frames)\n";
-        ss << "Target latency: " << kSenderLatencyMs << " ms (" << kTargetFifoLevel << " frames)\n";
-        ss << "Buffered: " << sendStats_.fifoLevel << " frames (error=" << sendStats_.lastError << ")\n";
-        ss << "  fifo=" << sendStats_.fifoOnly << "  asrc=" << sendStats_.asrcOnly << "  fifo_cap=" << sendStats_.fifoCapacity << "\n";
-        ss << "Sent: " << sendStats_.sentPackets << " packets (" << sendStats_.sentFrames << " frames)\n";
-        ss << "ASRC ratio: " << std::fixed << std::setprecision(1) << sendStats_.ratioPpm << " ppm";
-        ss << " (min=" << sendStats_.ratioPpmMin << ", max=" << sendStats_.ratioPpmMax << ")\n";
-        ss << "Underflows: " << sendStats_.underflows << "\n";
-        ss << "PTP warmup skips: " << sendStats_.ptpNotCalibratedSkips << "\n";
-        ss << "Deadline misses: " << sendStats_.deadlineMisses << "\n";
-        ss << "Overflows: " << sendStats_.overflows << "\n";
-    }
+    ss << "\n--- SENDER STATUS ---\n";
+    ss << "Mode: paced + drift compensated (per-sender ASRC)\n";
+    ss << "PTP calibrated: " << ((ptpSubscriber_ && ptpSubscriber_->get_local_clock().is_calibrated()) ? "Yes" : "No") << "\n";
 
     for (size_t i = 0; i < activeSenders_.size(); ++i)
     {
@@ -163,6 +247,7 @@ std::string RavennaNodeManager::getSenderDiagnostics() const
         ss << "  ID: " << s.id.to_string() << "\n";
         ss << "  Session: " << s.config.session_name << "\n";
         ss << "  Enabled: " << (s.enabled ? "Yes" : "No") << "\n";
+        ss << "  Input channel: " << (s.logicalInputChannel + 1) << "\n";
         ss << "  Format: " << (s.config.audio_format.sample_rate) << " Hz, "
            << static_cast<int>(s.config.audio_format.num_channels) << " ch, "
            << rav::to_string(s.config.audio_format.encoding) << "\n";
@@ -178,6 +263,25 @@ std::string RavennaNodeManager::getSenderDiagnostics() const
             ss << "  Dest: " << d.endpoint.address().to_string() << ":" << d.endpoint.port()
                << " (enabled=" << (d.enabled ? "true" : "false") << ")\n";
         }
+        if (!s.nmosSenderId.empty())
+            ss << "  NMOS sender_id: " << s.nmosSenderId << "\n";
+        if (!s.nmosFlowId.empty())
+            ss << "  NMOS flow_id: " << s.nmosFlowId << "\n";
+
+        if (s.stats)
+        {
+            ss << "  Sent: " << s.stats->sentPackets.load(std::memory_order_relaxed)
+               << " packets (" << s.stats->sentFrames.load(std::memory_order_relaxed) << " frames)\n";
+            ss << "  RTP ts: " << s.stats->lastRtpTimestamp.load(std::memory_order_relaxed) << "\n";
+            ss << "  Drift: " << std::fixed << std::setprecision(1) << s.stats->ratioPpm.load(std::memory_order_relaxed)
+               << " ppm (min=" << s.stats->ratioPpmMin.load(std::memory_order_relaxed)
+               << ", max=" << s.stats->ratioPpmMax.load(std::memory_order_relaxed) << ")\n";
+            ss << "  Buffered: fifo=" << s.stats->fifoOnly.load(std::memory_order_relaxed)
+               << " asrc=" << s.stats->asrcOnly.load(std::memory_order_relaxed)
+               << " err=" << s.stats->lastFifoError.load(std::memory_order_relaxed) << "\n";
+            ss << "  Underflows: " << s.stats->asrcUnderflows.load(std::memory_order_relaxed)
+               << "  Overflows: " << s.stats->fifoOverflows.load(std::memory_order_relaxed) << "\n";
+        }
     }
     return ss.str();
 }
@@ -185,7 +289,6 @@ std::string RavennaNodeManager::getSenderDiagnostics() const
 // RavennaNodeManager implementation
 RavennaNodeManager::RavennaNodeManager()
     : isActive_(false)
-    , rtpTimestamp_(0)
 {
 }
 
@@ -377,10 +480,19 @@ bool RavennaNodeManager::initialize()
     
     // Enable NMOS (IS-04 and IS-05 are enabled by default when NMOS is enabled)
     rav::nmos::Node::Configuration nmosConfig;
-    nmosConfig.id = boost::uuids::random_generator()();  // Required: generate a unique UUID for this node
+    nmosConfig.id = loadOrCreateNodeId();  // Persisted Node ID for registry friendliness
     nmosConfig.enabled = true;
     nmosNodeId_ = nmosConfig.id;
-    nmosConfig.api_port = 80;  // Default to 80 (as tested), fallback to 5555 if binding fails
+
+    // Prefer unprivileged port by default; allow override via env NMOS_NODE_PORT
+    uint16_t desiredNmosPort = 5555;
+    if (const char* envPort = std::getenv("NMOS_NODE_PORT"); envPort && std::strlen(envPort) > 0)
+    {
+        const int parsed = std::atoi(envPort);
+        if (parsed > 0 && parsed < 65535)
+            desiredNmosPort = static_cast<uint16_t>(parsed);
+    }
+    nmosConfig.api_port = desiredNmosPort;
     nmosConfig.label = "TestAES67Sender";
     nmosConfig.description = "RAVENNA AES67 Sender";
 
@@ -394,18 +506,17 @@ bool RavennaNodeManager::initialize()
 
         // Allow passing just host/ip (e.g. "nmos-registry.local" or "192.168.12.161")
         // - if no scheme: assume http
-        // - if no port: assume 80 (matches nmos-cpp docker default; if you need a different port, specify it explicitly)
+        // - if no port: assume 8010 (common easy-nmos / nmos-cpp default)
         const bool hasScheme = (configuredRegistryAddress_.find("://") != std::string::npos);
         if (!hasScheme)
             configuredRegistryAddress_ = "http://" + configuredRegistryAddress_;
 
-        // crude port detection: if there's no ':' after the scheme separator, append :8010
         const auto schemePos = configuredRegistryAddress_.find("://");
         const auto hostStart = (schemePos == std::string::npos) ? 0u : static_cast<unsigned>(schemePos + 3);
         const auto hostPort = configuredRegistryAddress_.substr(hostStart);
         const bool hasPort = (hostPort.find(':') != std::string::npos);
         if (!hasPort)
-            configuredRegistryAddress_ += ":80";
+            configuredRegistryAddress_ += ":8010";
 
         nmosConfig.operation_mode = rav::nmos::OperationMode::manual;
         nmosConfig.registry_address = configuredRegistryAddress_;
@@ -422,9 +533,9 @@ bool RavennaNodeManager::initialize()
     // #endregion
     
     auto nmosResult = node_->set_nmos_configuration(nmosConfig).get();
-    if (!nmosResult)
+    if (!nmosResult && nmosConfig.api_port != 5555)
     {
-        // If binding to 80 failed, retry with a non-privileged port (common on macOS if launched without permissions)
+        // Retry with fallback unprivileged port if custom port failed
         nmosConfig.api_port = 5555;
         setNmosConfigSnapshot(nmosConfig);
         auto retryResult = node_->set_nmos_configuration(nmosConfig).get();
@@ -491,38 +602,52 @@ bool RavennaNodeManager::start(const std::string& sessionName)
         // #endregion
         return false;
     }
-    
-    // If already active, do nothing (single-sender UI)
+
+    // If already active, do nothing
     if (isActive_)
     {
-        // #region agent log
         DEBUG_LOG("RavennaNodeManager.cpp:start:already_active", "Already active - returning true", "{}");
-        // #endregion
-        return true; // Already started
+        return true;
     }
-    
-    // Build a sender configuration for this new sender (index based on current count)
+
+    auto id = createSender(sessionName, 0);
+    const bool ok = id.is_valid();
+    if (ok)
+    {
+        DEBUG_LOG("RavennaNodeManager.cpp:start:success", "Sender created and enabled", "{\"senderId\":\"" + id.to_string() + "\"}");
+    }
+    else
+    {
+        DEBUG_LOG("RavennaNodeManager.cpp:start:create_failed", "Failed to create initial sender", "{}");
+    }
+    return ok;
+}
+
+rav::Id RavennaNodeManager::createSender(const std::string& sessionName, int logicalInputChannel)
+{
+    if (!node_)
+        return {};
+
+    if (activeSenders_.size() >= 64)
+        return {};
+
     const size_t senderIndex = activeSenders_.size();
     auto senderConfig = createSenderConfig(senderIndex, true);
     senderConfig.session_name = sessionName;
-    
-    // #region agent log
+
     {
         std::stringstream configData;
-        configData << "{\"senderIndex\":" << senderIndex 
-                   << ",\"sessionName\":\"" << sessionName 
+        configData << "{\"senderIndex\":" << senderIndex
+                   << ",\"sessionName\":\"" << sessionName
                    << "\",\"destAddress\":\"" << senderConfig.destinations[0].endpoint.address().to_string() << "\""
                    << ",\"destPort\":" << senderConfig.destinations[0].endpoint.port()
                    << ",\"enabled\":" << (senderConfig.enabled ? "true" : "false") << "}";
-        DEBUG_LOG("RavennaNodeManager.cpp:start:config", "Enabling sender 0", configData.str());
+        DEBUG_LOG("RavennaNodeManager.cpp:createSender:config", "Creating sender", configData.str());
     }
-    // #endregion
-    
-    // Create the sender (enabled)
+
     auto result = node_->create_sender(senderConfig).get();
     if (!result)
     {
-        // #region agent log
         std::string errorMsg = result.error();
         std::string escapedError;
         for (char c : errorMsg) {
@@ -531,28 +656,63 @@ bool RavennaNodeManager::start(const std::string& sessionName)
             else if (c == '\n') escapedError += "\\n";
             else escapedError += c;
         }
-        DEBUG_LOG("RavennaNodeManager.cpp:start:create_failed", "create_sender() failed", "{\"error\":\"" + escapedError + "\"}");
-        // #endregion
-        return false;
+        DEBUG_LOG("RavennaNodeManager.cpp:createSender:create_failed", "create_sender() failed", "{\"error\":\"" + escapedError + "\"}");
+        return {};
     }
-    
+
     SenderInstance instance;
     instance.id = *result;
     instance.config = senderConfig;
     instance.enabled = true;
-    activeSenders_.push_back(instance);
-    isActive_ = true;
-    
-    // Initialize RTP timestamp from PTP clock (we will add sender-side latency in send thread)
-    rtpTimestamp_ = ptpSubscriber_ ? ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate) : 0;
+    instance.logicalInputChannel = std::max(0, logicalInputChannel);
+    instance.stats = std::make_shared<SenderInstance::RuntimeStats>();
+    resetPipeline(instance.pipeline);
 
-    // Start sender-side FIFO + paced packetization thread
-    startSendThread();
-    
-    // #region agent log
-    DEBUG_LOG("RavennaNodeManager.cpp:start:success", "Sender created and enabled", "{\"senderId\":\"" + instance.id.to_string() + "\"}");
-    // #endregion
-    
+    if (auto ids = resolveLocalNmosIdsForLabel(sessionName))
+    {
+        instance.nmosSenderId = ids->first;
+        instance.nmosFlowId = ids->second;
+    }
+
+    activeSenders_.push_back(std::move(instance));
+    isActive_ = true;
+
+    // Ensure paced sender thread is running when we have at least one sender
+    if (!sendThreadRunning_.load(std::memory_order_acquire))
+        startSendThread();
+
+    return instance.id;
+}
+
+bool RavennaNodeManager::removeSender(rav::Id id)
+{
+    if (!node_ || !id.is_valid())
+        return false;
+
+    auto it = std::find_if(activeSenders_.begin(), activeSenders_.end(), [&](const SenderInstance& s) { return s.id == id; });
+    if (it == activeSenders_.end())
+        return false;
+
+    node_->remove_sender(id).wait();
+    DEBUG_LOG("RavennaNodeManager.cpp:removeSender", "Sender removed", "{\"senderId\":\"" + id.to_string() + "\"}");
+    activeSenders_.erase(it);
+    if (activeSenders_.empty())
+    {
+        isActive_ = false;
+        stopSendThread();
+    }
+    return true;
+}
+
+bool RavennaNodeManager::setSenderInputChannel(rav::Id id, int logicalInputChannel)
+{
+    auto it = std::find_if(activeSenders_.begin(), activeSenders_.end(), [&](const SenderInstance& s) { return s.id == id; });
+    if (it == activeSenders_.end())
+        return false;
+
+    it->logicalInputChannel = std::max(0, logicalInputChannel);
+    it->pipeline.timestampInitialized = false; // re-sync timestamp in paced thread
+    it->pipeline.rtpTimestamp = 0;
     return true;
 }
 
@@ -563,9 +723,8 @@ void RavennaNodeManager::stop()
         return;
     }
 
-    // Stop sender thread first (it may call into node_)
     stopSendThread();
-    
+
     // #region agent log
     DEBUG_LOG("RavennaNodeManager.cpp:stop:entry", "Stopping RAVENNA node manager", "{\"isActive\":" + std::string(isActive_ ? "true" : "false") + ",\"numActive\":" + std::to_string(activeSenders_.size()) + "}");
     // #endregion
@@ -645,67 +804,96 @@ void RavennaNodeManager::shutdown()
 
 bool RavennaNodeManager::isActive() const
 {
-    return isActive_ && !activeSenders_.empty() && activeSenders_[0].id.is_valid();
+    return isActive_ && !activeSenders_.empty();
 }
 
-bool RavennaNodeManager::sendAudio(const float* audioData, int numSamples)
+void RavennaNodeManager::processAudio(const float* const* inputChannelData,
+                                      int numInputChannels,
+                                      int numSamples,
+                                      const juce::BigInteger& activeInputs)
 {
-    if (!isActive() || !audioData || numSamples <= 0)
+    if (!isActive() || !inputChannelData || numInputChannels <= 0 || numSamples <= 0)
+        return;
+
+    // Build mapping from logical active-channel index -> actual device channel index
+    std::vector<int> logicalToPhysical;
+    logicalToPhysical.reserve(static_cast<size_t>(numInputChannels));
+    for (int ch = 0; ch < numInputChannels; ++ch)
     {
-        return false;
+        if (activeInputs[ch])
+        {
+            logicalToPhysical.push_back(ch);
+        }
     }
 
-    // Producer side: enqueue audio into FIFO. Packetization/sending is done from send thread.
-    const auto written = fifoWriteSamples(audioData, static_cast<uint32_t>(numSamples));
-    if (written < static_cast<uint32_t>(numSamples))
+    for (auto& sender : activeSenders_)
     {
-        fifoOverflows_.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        if (!sender.enabled || !sender.id.is_valid())
+            continue;
+
+        if (sender.logicalInputChannel < 0 || sender.logicalInputChannel >= static_cast<int>(logicalToPhysical.size()))
+            continue;
+
+        const int physicalIndex = logicalToPhysical[static_cast<size_t>(sender.logicalInputChannel)];
+        if (physicalIndex < 0 || physicalIndex >= numInputChannels)
+            continue;
+
+        const float* channelData = inputChannelData[physicalIndex];
+        if (channelData == nullptr)
+            continue;
+
+        // Producer side: enqueue audio into per-sender FIFO.
+        const auto written = fifoWriteSamples(sender.pipeline, channelData, static_cast<uint32_t>(numSamples));
+        if (written < static_cast<uint32_t>(numSamples))
+        {
+            sender.pipeline.fifoOverflows.fetch_add(1, std::memory_order_relaxed);
+            if (sender.stats)
+                sender.stats->fifoOverflows.store(sender.pipeline.fifoOverflows.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
     }
-    return true;
 }
 
-uint32_t RavennaNodeManager::fifoLevel() const
+uint32_t RavennaNodeManager::fifoLevel(const SenderInstance::Pipeline& p) const
 {
-    const auto w = fifoWrite_.load(std::memory_order_acquire);
-    const auto r = fifoRead_.load(std::memory_order_acquire);
+    const auto w = p.fifoWrite.load(std::memory_order_acquire);
+    const auto r = p.fifoRead.load(std::memory_order_acquire);
     const auto avail = (w >= r) ? (w - r) : 0;
-    return static_cast<uint32_t>(std::min<uint64_t>(avail, static_cast<uint64_t>(fifo_.size())));
+    return static_cast<uint32_t>(std::min<uint64_t>(avail, static_cast<uint64_t>(p.fifo.size())));
 }
 
-uint32_t RavennaNodeManager::fifoWriteSamples(const float* data, uint32_t n)
+uint32_t RavennaNodeManager::fifoWriteSamples(SenderInstance::Pipeline& p, const float* data, uint32_t n)
 {
-    if (fifo_.empty() || fifoMask_ == 0 || n == 0)
+    if (p.fifo.empty() || p.fifoMask == 0 || n == 0)
         return 0;
 
-    const auto w = fifoWrite_.load(std::memory_order_relaxed);
-    const auto r = fifoRead_.load(std::memory_order_acquire);
+    const auto w = p.fifoWrite.load(std::memory_order_relaxed);
+    const auto r = p.fifoRead.load(std::memory_order_acquire);
     const uint64_t used = (w >= r) ? (w - r) : 0;
-    const uint64_t cap = static_cast<uint64_t>(fifo_.size());
+    const uint64_t cap = static_cast<uint64_t>(p.fifo.size());
     const uint64_t free = (used >= cap) ? 0 : (cap - used);
     const uint32_t toWrite = static_cast<uint32_t>(std::min<uint64_t>(free, n));
 
     for (uint32_t i = 0; i < toWrite; ++i)
-        fifo_[(w + i) & fifoMask_] = data[i];
+        p.fifo[(w + i) & p.fifoMask] = data[i];
 
-    fifoWrite_.store(w + toWrite, std::memory_order_release);
+    p.fifoWrite.store(w + toWrite, std::memory_order_release);
     return toWrite;
 }
 
-uint32_t RavennaNodeManager::fifoReadSamples(float* dst, uint32_t n)
+uint32_t RavennaNodeManager::fifoReadSamples(SenderInstance::Pipeline& p, float* dst, uint32_t n)
 {
-    if (fifo_.empty() || fifoMask_ == 0 || n == 0)
+    if (p.fifo.empty() || p.fifoMask == 0 || n == 0)
         return 0;
 
-    const auto r = fifoRead_.load(std::memory_order_relaxed);
-    const auto w = fifoWrite_.load(std::memory_order_acquire);
+    const auto r = p.fifoRead.load(std::memory_order_relaxed);
+    const auto w = p.fifoWrite.load(std::memory_order_acquire);
     const uint64_t avail = (w >= r) ? (w - r) : 0;
     const uint32_t toRead = static_cast<uint32_t>(std::min<uint64_t>(avail, n));
 
     for (uint32_t i = 0; i < toRead; ++i)
-        dst[i] = fifo_[(r + i) & fifoMask_];
+        dst[i] = p.fifo[(r + i) & p.fifoMask];
 
-    fifoRead_.store(r + toRead, std::memory_order_release);
+    p.fifoRead.store(r + toRead, std::memory_order_release);
     return toRead;
 }
 
@@ -713,27 +901,7 @@ void RavennaNodeManager::startSendThread()
 {
     stopSendThread();
 
-    fifo_.assign(kFifoCapacityFrames, 0.0f);
-    fifoMask_ = fifo_.size() - 1;
-    fifoWrite_.store(0, std::memory_order_release);
-    fifoRead_.store(0, std::memory_order_release);
-    fifoOverflows_.store(0, std::memory_order_release);
-    lastSample_ = 0.0f;
-
     buildSincTable();
-    asrcReset();
-
-    {
-        std::lock_guard<std::mutex> lock(sendStatsMutex_);
-        sendStats_ = SendStats{};
-        sendStats_.startTime = std::chrono::steady_clock::now();
-        sendStats_.fifoCapacity = static_cast<uint32_t>(fifo_.size());
-        sendStats_.fifoLevel = 0;
-        sendStats_.targetLevel = kTargetFifoLevel;
-        sendStats_.ratioPpm = 0.0;
-        sendStats_.ratioPpmMin = 0.0;
-        sendStats_.ratioPpmMax = 0.0;
-    }
 
     sendThreadRunning_.store(true, std::memory_order_release);
     sendThread_ = std::thread([this] { sendThreadMain(); });
@@ -757,9 +925,7 @@ void RavennaNodeManager::sendThreadMain()
     auto nextWake = std::chrono::steady_clock::now();
 
     std::array<float, kFramesPerPacket> out {};
-
-    bool timestampInitialized = false;
-    uint32_t ptpWarmupSkips = 0;
+    // Deadline monitoring: count late wakes for debugging (best-effort)
     uint32_t deadlineMisses = 0;
 
     while (sendThreadRunning_.load(std::memory_order_acquire))
@@ -781,112 +947,100 @@ void RavennaNodeManager::sendThreadMain()
             continue;
         }
 
-        if (activeSenders_.empty() || !activeSenders_[0].id.is_valid())
+        if (activeSenders_.empty())
         {
             std::this_thread::sleep_until(nextWake);
             continue;
         }
 
-        const uint32_t fifoLvl = fifoLevel();
-        const uint32_t asrcLvl = asrcBufferedFrames();
-        const uint32_t totalBuffered = fifoLvl + asrcLvl;
-
-        if (!timestampInitialized)
+        for (auto& s : activeSenders_)
         {
-            if (!ptpSubscriber_->get_local_clock().is_calibrated())
-            {
-                ptpWarmupSkips++;
-                std::this_thread::sleep_until(nextWake);
+            if (!s.enabled || !s.id.is_valid())
                 continue;
+
+            auto& p = s.pipeline;
+            const uint32_t fifoLvl = fifoLevel(p);
+            const uint32_t asrcLvl = asrcBufferedFrames(p);
+            const uint32_t totalBuffered = fifoLvl + asrcLvl;
+
+            if (!p.timestampInitialized)
+            {
+                if (!ptpSubscriber_->get_local_clock().is_calibrated())
+                    continue;
+
+                if (totalBuffered < (kTargetFifoLevel + kSincTaps))
+                {
+                    (void)asrcFillFromFifo(p, kTargetFifoLevel + kSincTaps + kFramesPerPacket * 2, 512);
+                    continue;
+                }
+
+                const auto nowTs = ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate);
+                p.rtpTimestamp = nowTs + kTargetFifoLevel;
+                p.timestampInitialized = true;
             }
 
-            // Warm-up: wait until TOTAL buffered audio reaches our target sender latency.
-            // (FIFO may be low if ASRC ring already holds samples.)
-            if (totalBuffered < (kTargetFifoLevel + kSincTaps))
+            const int32_t error = static_cast<int32_t>(totalBuffered) - static_cast<int32_t>(kTargetFifoLevel);
+
+            constexpr double kP = 1.0 / 2'000'000.0;
+            constexpr double kI = 1.0 / 50'000'000.0;
+            constexpr double kMaxPpm = 2000.0;
+            constexpr double kRatioSmoothing = 0.01;
+
+            p.ratioIntegral += static_cast<double>(error) * kI;
+            p.ratioIntegral = std::clamp(p.ratioIntegral, -kMaxPpm * 1e-6, kMaxPpm * 1e-6);
+
+            p.ratio = 1.0 + static_cast<double>(error) * kP + p.ratioIntegral;
+            p.ratio = std::clamp(p.ratio, 1.0 - kMaxPpm * 1e-6, 1.0 + kMaxPpm * 1e-6);
+            p.ratioSmoothed += (p.ratio - p.ratioSmoothed) * kRatioSmoothing;
+
+            constexpr uint32_t kAsrcHeadroom = kSincTaps + (kFramesPerPacket * 4);
+            (void)asrcFillFromFifo(p, kTargetFifoLevel + kAsrcHeadroom, 512);
+
+            bool underflow = false;
+            for (uint32_t i = 0; i < kFramesPerPacket; ++i)
             {
-                // Keep ASRC topped up to avoid underflows once we start.
-                (void)asrcFillFromFifo(kTargetFifoLevel + kSincTaps + kFramesPerPacket * 2, 512);
-                std::this_thread::sleep_until(nextWake);
-                continue;
+                const float y = asrcResampleOne(p, p.ratioSmoothed);
+                out[i] = y;
+                p.lastSample = y;
+                if (!underflow && p.asrcWrite < (p.asrcRead + static_cast<uint64_t>(kSincTaps) + 4))
+                    underflow = true;
             }
 
-            const auto nowTs = ptpSubscriber_->get_local_clock().now().to_rtp_timestamp32(kSampleRate);
-            rtpTimestamp_ = nowTs + kTargetFifoLevel; // stamp packets kSenderLatencyMs into the future
-            timestampInitialized = true;
-        }
+            const float* channels[] = { out.data() };
+            rav::AudioBufferView<const float> bufferView(channels, kNumChannels, static_cast<size_t>(kFramesPerPacket));
+            (void)node_->send_audio_data_realtime(s.id, bufferView, p.rtpTimestamp);
+            p.rtpTimestamp += kFramesPerPacket;
 
-        // Control on TOTAL buffered audio, not just FIFO.
-        // This keeps end-to-end sender latency near kSenderLatencyMs instead of filling the ASRC ring.
-        const int32_t error = static_cast<int32_t>(totalBuffered) - static_cast<int32_t>(kTargetFifoLevel);
-
-        // Continuous ASRC (PI controller on FIFO error).
-        // ratio > 1 consumes more input per output -> FIFO level decreases
-        // ratio < 1 consumes less input per output -> FIFO level increases
-        //
-        // We keep ratio changes very small and smooth to avoid audible modulation.
-        constexpr double kP = 1.0 / 2'000'000.0;  // proportional gain (per-sample error -> ratio)
-        constexpr double kI = 1.0 / 50'000'000.0; // integral gain
-        constexpr double kMaxPpm = 2000.0;        // clamp ratio within +/- 2000 ppm
-        constexpr double kRatioSmoothing = 0.01;  // smooth ratio to avoid jitter
-
-        ratioIntegral_ += static_cast<double>(error) * kI;
-        ratioIntegral_ = std::clamp(ratioIntegral_, -kMaxPpm * 1e-6, kMaxPpm * 1e-6);
-
-        ratio_ = 1.0 + static_cast<double>(error) * kP + ratioIntegral_;
-        ratio_ = std::clamp(ratio_, 1.0 - kMaxPpm * 1e-6, 1.0 + kMaxPpm * 1e-6);
-        ratioSmoothed_ += (ratio_ - ratioSmoothed_) * kRatioSmoothing;
-
-        // Keep ASRC ring at a small headroom above target (avoid underflow, avoid huge latency)
-        constexpr uint32_t kAsrcHeadroom = kSincTaps + (kFramesPerPacket * 4); // ~ a few ms + taps
-        (void)asrcFillFromFifo(kTargetFifoLevel + kAsrcHeadroom, 512);
-
-        bool underflow = false;
-        // Generate exactly 48 output samples with bandlimited interpolation
-        for (uint32_t i = 0; i < kFramesPerPacket; ++i)
-        {
-            const float y = asrcResampleOne(ratioSmoothed_);
-            out[i] = y;
-            lastSample_ = y;
-            // asrcResampleOne() returns lastSample_ on underflow; detect it conservatively
-            // by checking if we are reusing lastSample_ AND we're short on buffered ASRC data.
-            if (!underflow && asrcWrite_ < (asrcRead_ + static_cast<uint64_t>(kSincTaps) + 4))
-                underflow = true;
-        }
-
-        lastSample_ = out[kFramesPerPacket - 1];
-
-        const float* channels[] = { out.data() };
-        rav::AudioBufferView<const float> bufferView(channels, kNumChannels, static_cast<size_t>(kFramesPerPacket));
-
-        (void)node_->send_audio_data_realtime(activeSenders_[0].id, bufferView, rtpTimestamp_);
-        rtpTimestamp_ += kFramesPerPacket;
-
-        {
-            std::lock_guard<std::mutex> lock(sendStatsMutex_);
-            sendStats_.fifoLevel = totalBuffered;
-            sendStats_.fifoOnly = fifoLvl;
-            sendStats_.asrcOnly = asrcLvl;
-            sendStats_.lastError = error;
-            sendStats_.sentPackets++;
-            sendStats_.sentFrames += kFramesPerPacket;
-            sendStats_.overflows = fifoOverflows_.load(std::memory_order_relaxed);
-            if (underflow) sendStats_.underflows++;
-            sendStats_.ptpNotCalibratedSkips = ptpWarmupSkips;
-            sendStats_.deadlineMisses = deadlineMisses;
-            const double ppm = (ratioSmoothed_ - 1.0) * 1e6;
-            sendStats_.ratioPpm = ppm;
-            if (sendStats_.sentPackets == 1)
+            if (s.stats)
             {
-                sendStats_.ratioPpmMin = ppm;
-                sendStats_.ratioPpmMax = ppm;
-            }
-            else
-            {
-                sendStats_.ratioPpmMin = std::min(sendStats_.ratioPpmMin, ppm);
-                sendStats_.ratioPpmMax = std::max(sendStats_.ratioPpmMax, ppm);
+                s.stats->sentPackets.fetch_add(1, std::memory_order_relaxed);
+                s.stats->sentFrames.fetch_add(kFramesPerPacket, std::memory_order_relaxed);
+                s.stats->lastRtpTimestamp.store(p.rtpTimestamp, std::memory_order_relaxed);
+                s.stats->fifoOnly.store(fifoLvl, std::memory_order_relaxed);
+                s.stats->asrcOnly.store(asrcLvl, std::memory_order_relaxed);
+                s.stats->lastFifoError.store(error, std::memory_order_relaxed);
+
+                const double ppm = (p.ratioSmoothed - 1.0) * 1e6;
+                s.stats->ratioPpm.store(ppm, std::memory_order_relaxed);
+                const auto prevMin = s.stats->ratioPpmMin.load(std::memory_order_relaxed);
+                const auto prevMax = s.stats->ratioPpmMax.load(std::memory_order_relaxed);
+                if (s.stats->sentPackets.load(std::memory_order_relaxed) <= 1)
+                {
+                    s.stats->ratioPpmMin.store(ppm, std::memory_order_relaxed);
+                    s.stats->ratioPpmMax.store(ppm, std::memory_order_relaxed);
+                }
+                else
+                {
+                    s.stats->ratioPpmMin.store(std::min(prevMin, ppm), std::memory_order_relaxed);
+                    s.stats->ratioPpmMax.store(std::max(prevMax, ppm), std::memory_order_relaxed);
+                }
+                if (underflow)
+                    s.stats->asrcUnderflows.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
+        // Keep the compiler happy (we may surface this later in UI)
+        (void)deadlineMisses;
         std::this_thread::sleep_until(nextWake);
     }
 }
@@ -951,39 +1105,49 @@ void RavennaNodeManager::buildSincTable()
     }
 }
 
-void RavennaNodeManager::asrcReset()
+void RavennaNodeManager::resetPipeline(SenderInstance::Pipeline& p)
 {
-    asrcRing_.assign(kAsrcRingFrames, 0.0f);
-    asrcMask_ = asrcRing_.size() - 1;
-    asrcWrite_ = 0;
-    asrcRead_ = 0;
-    asrcFrac_ = 0.0;
-    ratio_ = 1.0;
-    ratioSmoothed_ = 1.0;
-    ratioIntegral_ = 0.0;
-    asrcTmp_.assign(512, 0.0f);
+    p.fifo.assign(kFifoCapacityFrames, 0.0f);
+    p.fifoMask = p.fifo.size() - 1;
+    p.fifoWrite.store(0, std::memory_order_release);
+    p.fifoRead.store(0, std::memory_order_release);
+    p.fifoOverflows.store(0, std::memory_order_release);
+
+    p.asrcRing.assign(kAsrcRingFrames, 0.0f);
+    p.asrcMask = p.asrcRing.size() - 1;
+    p.asrcWrite = 0;
+    p.asrcRead = 0;
+    p.asrcFrac = 0.0;
+    p.asrcTmp.assign(512, 0.0f);
+
+    p.ratio = 1.0;
+    p.ratioSmoothed = 1.0;
+    p.ratioIntegral = 0.0;
+    p.lastSample = 0.0f;
+    p.rtpTimestamp = 0;
+    p.timestampInitialized = false;
 }
 
-uint32_t RavennaNodeManager::asrcBufferedFrames() const
+uint32_t RavennaNodeManager::asrcBufferedFrames(const SenderInstance::Pipeline& p) const
 {
-    const uint64_t used = (asrcWrite_ >= asrcRead_) ? (asrcWrite_ - asrcRead_) : 0;
-    return static_cast<uint32_t>(std::min<uint64_t>(used, static_cast<uint64_t>(asrcRing_.size())));
+    const uint64_t used = (p.asrcWrite >= p.asrcRead) ? (p.asrcWrite - p.asrcRead) : 0;
+    return static_cast<uint32_t>(std::min<uint64_t>(used, static_cast<uint64_t>(p.asrcRing.size())));
 }
 
-uint32_t RavennaNodeManager::asrcFillFromFifo(uint32_t desiredBufferedFrames, uint32_t maxFramesPerCall)
+uint32_t RavennaNodeManager::asrcFillFromFifo(SenderInstance::Pipeline& p, uint32_t desiredBufferedFrames, uint32_t maxFramesPerCall)
 {
-    if (asrcRing_.empty() || asrcMask_ == 0)
+    if (p.asrcRing.empty() || p.asrcMask == 0)
         return 0;
 
-    const uint64_t buffered = (asrcWrite_ >= asrcRead_) ? (asrcWrite_ - asrcRead_) : 0;
+    const uint64_t buffered = (p.asrcWrite >= p.asrcRead) ? (p.asrcWrite - p.asrcRead) : 0;
     if (buffered >= desiredBufferedFrames)
         return 0;
 
     const uint64_t need = static_cast<uint64_t>(desiredBufferedFrames) - buffered;
 
-    // Free space (leave at least kSincTaps + 4 samples to avoid overwrite of history)
-    const uint64_t cap = static_cast<uint64_t>(asrcRing_.size());
-    const uint64_t used = (asrcWrite_ >= asrcRead_) ? (asrcWrite_ - asrcRead_) : 0;
+    // Free space
+    const uint64_t cap = static_cast<uint64_t>(p.asrcRing.size());
+    const uint64_t used = (p.asrcWrite >= p.asrcRead) ? (p.asrcWrite - p.asrcRead) : 0;
     const uint64_t free = (used >= cap) ? 0 : (cap - used);
     const uint32_t toPull = static_cast<uint32_t>(
         std::min<uint64_t>(std::min<uint64_t>(std::min<uint64_t>(free, need), maxFramesPerCall), 4096)
@@ -991,34 +1155,30 @@ uint32_t RavennaNodeManager::asrcFillFromFifo(uint32_t desiredBufferedFrames, ui
     if (toPull == 0)
         return 0;
 
-    if (asrcTmp_.size() < toPull)
-        asrcTmp_.resize(toPull);
+    if (p.asrcTmp.size() < toPull)
+        p.asrcTmp.resize(toPull);
 
-    const uint32_t got = fifoReadSamples(asrcTmp_.data(), toPull);
+    const uint32_t got = fifoReadSamples(p, p.asrcTmp.data(), toPull);
 
     for (uint32_t i = 0; i < got; ++i)
-    {
-        asrcRing_[(asrcWrite_ + i) & asrcMask_] = asrcTmp_[i];
-    }
-    asrcWrite_ += got;
+        p.asrcRing[(p.asrcWrite + i) & p.asrcMask] = p.asrcTmp[i];
+
+    p.asrcWrite += got;
     return got;
 }
 
-float RavennaNodeManager::asrcGetSample(uint64_t idx) const
+float RavennaNodeManager::asrcGetSample(const SenderInstance::Pipeline& p, uint64_t idx) const
 {
-    return asrcRing_[idx & asrcMask_];
+    return p.asrcRing[idx & p.asrcMask];
 }
 
-float RavennaNodeManager::asrcResampleOne(double ratio)
+float RavennaNodeManager::asrcResampleOne(SenderInstance::Pipeline& p, double ratio)
 {
-    // Ensure we have enough samples ahead: read position plus taps + a couple of samples.
-    // If not, return lastSample_ (underflow concealment).
-    const uint64_t needAhead = asrcRead_ + static_cast<uint64_t>(kSincTaps) + 4;
-    if (asrcWrite_ < needAhead)
-        return lastSample_;
+    const uint64_t needAhead = p.asrcRead + static_cast<uint64_t>(kSincTaps) + 4;
+    if (p.asrcWrite < needAhead)
+        return p.lastSample;
 
-    // Phase index
-    const double frac = std::clamp(asrcFrac_, 0.0, 0.999999);
+    const double frac = std::clamp(p.asrcFrac, 0.0, 0.999999);
     const uint32_t phase = static_cast<uint32_t>(frac * static_cast<double>(kSincPhases));
     const uint32_t base = phase * kSincTaps;
 
@@ -1030,18 +1190,17 @@ float RavennaNodeManager::asrcResampleOne(double ratio)
     for (int i = 0; i < taps; ++i)
     {
         const int n = i - centerOffset;
-        const uint64_t si = static_cast<uint64_t>(static_cast<int64_t>(asrcRead_) + n);
-        const float x = asrcGetSample(si);
+        const uint64_t si = static_cast<uint64_t>(static_cast<int64_t>(p.asrcRead) + n);
+        const float x = asrcGetSample(p, si);
         const float c = sincTable_[base + static_cast<uint32_t>(i)];
         acc += static_cast<double>(x) * static_cast<double>(c);
     }
 
-    // Advance input position by ratio (input samples per output sample)
-    asrcFrac_ += ratio;
-    while (asrcFrac_ >= 1.0)
+    p.asrcFrac += ratio;
+    while (p.asrcFrac >= 1.0)
     {
-        asrcFrac_ -= 1.0;
-        asrcRead_ += 1;
+        p.asrcFrac -= 1.0;
+        p.asrcRead += 1;
     }
 
     return static_cast<float>(acc);
@@ -1065,6 +1224,27 @@ std::vector<std::string> RavennaNodeManager::getAvailableInterfaces() const
     }
     
     return interfaceNames;
+}
+
+std::vector<RavennaNodeManager::SenderInfo> RavennaNodeManager::listSenders() const
+{
+    std::vector<SenderInfo> out;
+    for (const auto& s : activeSenders_)
+    {
+        SenderInfo info;
+        info.id = s.id;
+        info.sessionName = s.config.session_name;
+        if (!s.config.destinations.empty())
+        {
+            info.destAddress = s.config.destinations[0].endpoint.address().to_string();
+            info.destPort = s.config.destinations[0].endpoint.port();
+        }
+        info.logicalInputChannel = s.logicalInputChannel;
+        info.nmosSenderId = s.nmosSenderId;
+        info.nmosFlowId = s.nmosFlowId;
+        out.push_back(std::move(info));
+    }
+    return out;
 }
 
 bool RavennaNodeManager::setNetworkInterface(const std::string& interfaceName)

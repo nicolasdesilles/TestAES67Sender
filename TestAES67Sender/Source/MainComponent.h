@@ -4,6 +4,7 @@
 #include "RavennaNodeManager.h"
 #include <atomic>
 #include <memory>
+#include <chrono>
 
 namespace AudioApp
 {
@@ -25,9 +26,16 @@ private:
     void updateInputChannels();
     void updatePtpStatus();
     void updateNmosStatus();
+    void refreshReceivers();
+    void refreshSendersUi();
     void onNetworkInterfaceChanged();
     void onInputChannelChanged();
-    void onStartStopClicked();
+    void onAddSender();
+    void onRemoveSender();
+    void onSenderSelectionChanged();
+    void onSenderInputChannelChanged();
+    void onConnectReceiver();
+    void onDisconnectReceiver();
     void timerCallback() override;
 
     juce::AudioDeviceSelectorComponent selector {
@@ -37,26 +45,47 @@ private:
     RavennaNodeManager ravennaManager_;
     bool ravennaInitialized_{false};
     
-    // UI Components
+    // Tabs
+    juce::TabbedComponent tabs_{juce::TabbedButtonBar::TabsAtTop};
+
+    // Audio tab
+    juce::Component audioTab_;
     juce::Label networkInterfaceLabel_;
     juce::ComboBox networkInterfaceCombo_;
     juce::Label inputChannelLabel_;
     juce::ComboBox inputChannelCombo_;
+    juce::Label inputLevelValueLabel_;
+
+    // Logs tab
+    juce::Component logsTab_;
     juce::Label ptpStatusLabel_;
     juce::Label ptpStatusValue_;
     juce::Label ptpDiagnosticsLabel_;
     juce::TextEditor ptpDiagnosticsText_;
-
     juce::Label nmosStatusLabel_;
     juce::Label nmosStatusValue_;
     juce::Label nmosDiagnosticsLabel_;
     juce::TextEditor nmosDiagnosticsText_;
-
     juce::Label senderStatusLabel_;
     juce::Label senderStatusValue_;
     juce::Label senderDiagnosticsLabel_;
     juce::TextEditor senderDiagnosticsText_;
-    juce::TextButton startStopButton_;
+
+    // Senders tab
+    juce::Component sendersTab_;
+    juce::ComboBox senderSelector_;
+    juce::TextButton addSenderButton_{"Add Sender"};
+    juce::TextButton removeSenderButton_{"Remove Sender"};
+    juce::Label senderInputChannelLabel_{"Sender Input", "Input Channel:"};
+    juce::ComboBox senderInputChannelCombo_;
+    juce::TextButton connectButton_{"Connect Receiver"};
+    juce::TextButton disconnectButton_{"Disconnect"};
+    juce::Label receiverSelectLabel_{"Receiver", "Receiver:"};
+    juce::ComboBox receiverCombo_;
+
+    // Receivers tab
+    juce::Component receiversTab_;
+    juce::TextEditor receiversListBox_;
     
     // Signal meter component
     class LevelMeter : public juce::Component, public juce::Timer
@@ -128,7 +157,6 @@ private:
     };
     
     LevelMeter inputLevelMeter_;
-    juce::Label inputLevelValueLabel_;
     
     std::atomic<float> currentInputLevelDb_{-100.0f};
 
@@ -156,8 +184,33 @@ private:
 
     // State
     int selectedInputChannel_{0};
+    int selectedMeterPhysicalChannel_{0};
+    std::vector<int> meterPhysicalChannelMap_;
     double currentSampleRate_{48000.0};
     std::atomic<float> currentInputLevel_{0.0f};
+    std::vector<RavennaNodeManager::SenderInfo> senderInfos_;
+    struct DeviceInfo
+    {
+        std::string id;
+        std::string label;
+        std::string type;
+        std::string nodeId;
+        std::string href;
+    };
+    std::vector<DeviceInfo> devices_;
+    struct ReceiverInfo
+    {
+        std::string id;
+        std::string label;
+        std::string nodeId;
+        std::string href;
+        std::string connectionBase;
+        std::string transport;
+    };
+    std::vector<ReceiverInfo> receivers_;
+
+    std::atomic<bool> receiversFetchInFlight_{false};
+    std::chrono::steady_clock::time_point lastReceiversFetch_{};
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

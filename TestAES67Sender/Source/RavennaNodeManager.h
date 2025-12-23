@@ -6,6 +6,7 @@
 #include "ravennakit/core/audio/audio_buffer_view.hpp"
 #include "ravennakit/core/util/id.hpp"
 #include "ravennakit/ptp/ptp_instance.hpp"
+#include <juce_core/juce_core.h>
 
 #include <string>
 #include <vector>
@@ -44,8 +45,8 @@ public:
     bool start(const std::string& sessionName = "TestAES67Sender");
 
     /**
-     * Stop sending audio (disables the sender but keeps NMOS registration).
-     * The sender can be restarted with start().
+     * Stop sending audio (removes all senders but keeps NMOS registration active).
+     * Senders can be recreated with start() or createSender().
      */
     void stop();
     
@@ -62,12 +63,29 @@ public:
     bool isActive() const;
 
     /**
-     * Send audio data to the network.
-     * @param audioData Pointer to float audio samples (mono)
-     * @param numSamples Number of samples to send
-     * @return true if send was successful, false otherwise
+     * Send audio for all active senders (fan-out by per-sender input channel).
+     * @param inputChannelData Raw device buffers from JUCE callback
+     * @param numInputChannels Number of input channels in buffer
+     * @param numSamples Samples per channel
+     * @param activeInputs Bitmask of active inputs (from JUCE device)
      */
-    bool sendAudio(const float* audioData, int numSamples);
+    void processAudio(const float* const* inputChannelData, int numInputChannels, int numSamples, const juce::BigInteger& activeInputs);
+
+    /**
+     * Create a sender with the given session name and logical input channel index.
+     * @return rav::Id of the created sender, or invalid Id on failure.
+     */
+    rav::Id createSender(const std::string& sessionName, int logicalInputChannel);
+
+    /**
+     * Remove a sender by id (deregisters and stops streaming).
+     */
+    bool removeSender(rav::Id id);
+
+    /**
+     * Change the logical input channel (index within active inputs) for a sender.
+     */
+    bool setSenderInputChannel(rav::Id id, int logicalInputChannel);
 
     /**
      * Get list of available network interface names.
@@ -124,9 +142,32 @@ public:
     std::string getNmosDiagnostics() const;
 
     /**
+     * Best-effort registry base URL (scheme://host:port) for IS-04 Query API calls.
+     * - If NMOS_REGISTRY_ADDRESS was configured, returns that.
+     * - Otherwise uses discovered registry info when available.
+     */
+    std::string getRegistryBaseUrl() const;
+
+    /**
      * Get sender diagnostics (active sender IDs, destinations, audio format, etc.).
      */
     std::string getSenderDiagnostics() const;
+    
+    struct SenderInfo
+    {
+        rav::Id id;
+        std::string sessionName;
+        std::string destAddress;
+        uint16_t destPort{0};
+        int logicalInputChannel{0};
+        std::string nmosSenderId;
+        std::string nmosFlowId;
+    };
+
+    /**
+     * List active senders with basic info for UI/connection logic.
+     */
+    std::vector<SenderInfo> listSenders() const;
     
     /**
      * Check if PTP is stuck and needs retry.
@@ -137,6 +178,12 @@ public:
     bool checkAndRetryPtpIfStuck();
 
 private:
+    // Persisted NMOS node identity helpers
+    boost::uuids::uuid loadOrCreateNodeId();
+    void persistNodeId(const boost::uuids::uuid& id);
+    juce::File getNodeIdFile() const;
+    std::optional<std::pair<std::string, std::string>> resolveLocalNmosIdsForLabel(const std::string& label) const;
+
     // Receives RavennaNode callbacks (NMOS status/config, etc.) on the maintenance thread
     class NodeSubscriber final : public rav::RavennaNode::Subscriber
     {
@@ -152,9 +199,98 @@ private:
 
     struct SenderInstance
     {
+        struct RuntimeStats
+        {
+            std::atomic<uint64_t> sentPackets{0};
+            std::atomic<uint64_t> sentFrames{0};
+            std::atomic<uint32_t> lastRtpTimestamp{0};
+            std::atomic<uint32_t> fifoOverflows{0};
+            std::atomic<uint32_t> asrcUnderflows{0};
+            std::atomic<int32_t> lastFifoError{0};
+            std::atomic<double> ratioPpm{0.0};
+            std::atomic<double> ratioPpmMin{0.0};
+            std::atomic<double> ratioPpmMax{0.0};
+            std::atomic<uint32_t> fifoOnly{0};
+            std::atomic<uint32_t> asrcOnly{0};
+        };
+
         rav::Id id;
         rav::RavennaSender::Configuration config;
         bool enabled{false};
+        int logicalInputChannel{0};      // index within active input channels
+        std::string nmosSenderId;
+        std::string nmosFlowId;
+        std::shared_ptr<RuntimeStats> stats{std::make_shared<RuntimeStats>()};
+
+        // Per-sender drift-compensated streaming pipeline
+        struct Pipeline
+        {
+            Pipeline() = default;
+            Pipeline(const Pipeline&) = delete;
+            Pipeline& operator=(const Pipeline&) = delete;
+
+            Pipeline(Pipeline&& other) noexcept { *this = std::move(other); }
+
+            Pipeline& operator=(Pipeline&& other) noexcept
+            {
+                if (this == &other) return *this;
+
+                rtpTimestamp = other.rtpTimestamp;
+                timestampInitialized = other.timestampInitialized;
+
+                fifo = std::move(other.fifo);
+                fifoMask = other.fifoMask;
+                fifoWrite.store(other.fifoWrite.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                fifoRead.store(other.fifoRead.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                fifoOverflows.store(other.fifoOverflows.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+                asrcRing = std::move(other.asrcRing);
+                asrcMask = other.asrcMask;
+                asrcWrite = other.asrcWrite;
+                asrcRead = other.asrcRead;
+                asrcFrac = other.asrcFrac;
+                asrcTmp = std::move(other.asrcTmp);
+
+                ratio = other.ratio;
+                ratioSmoothed = other.ratioSmoothed;
+                ratioIntegral = other.ratioIntegral;
+
+                lastSample = other.lastSample;
+                return *this;
+            }
+
+            // RTP timestamp tracking for paced send thread
+            uint32_t rtpTimestamp{0};
+            bool timestampInitialized{false};
+
+            // SPSC ring buffer (audio thread producer, send thread consumer)
+            std::vector<float> fifo;
+            size_t fifoMask{0};
+            std::atomic<uint64_t> fifoWrite{0};
+            std::atomic<uint64_t> fifoRead{0};
+            std::atomic<uint32_t> fifoOverflows{0};
+
+            // ASRC ring buffer
+            std::vector<float> asrcRing;
+            size_t asrcMask{0};
+            uint64_t asrcWrite{0};
+            uint64_t asrcRead{0};
+            double asrcFrac{0.0};
+            std::vector<float> asrcTmp;
+
+            // PI controller state
+            double ratio{1.0};
+            double ratioSmoothed{1.0};
+            double ratioIntegral{0.0};
+
+            float lastSample{0.0f};
+        } pipeline;
+
+        SenderInstance() = default;
+        SenderInstance(const SenderInstance&) = delete;
+        SenderInstance& operator=(const SenderInstance&) = delete;
+        SenderInstance(SenderInstance&&) noexcept = default;
+        SenderInstance& operator=(SenderInstance&&) noexcept = default;
     };
     
     std::unique_ptr<rav::RavennaNode> node_;
@@ -162,6 +298,7 @@ private:
     std::vector<SenderInstance> activeSenders_; // Dynamically created senders
     std::atomic<bool> isActive_;                // True if at least one sender is active
     std::string currentInterface_;
+    uint16_t nmosPort_{0};
     
     // PTP subscriber to monitor synchronization
     class PtpSubscriber : public rav::ptp::Instance::Subscriber
@@ -233,68 +370,18 @@ private:
     
     std::unique_ptr<PtpSubscriber> ptpSubscriber_;
     
-    // RTP timestamp tracking
-    uint32_t rtpTimestamp_;
-
     // Sender-side buffering / pacing
-    // We enqueue audio from the JUCE callback and send fixed 1ms packets from a dedicated thread.
-    // Clock drift is handled by an "elastic buffer" (occasional single-sample drop/dup),
-    // rather than manipulating RTP timestamps (which would create discontinuities).
+    // We enqueue audio from the JUCE callback into each sender FIFO and send fixed 1ms packets from a dedicated thread.
+    // Drift is handled per-sender with a PI-controlled ASRC.
     std::thread sendThread_;
     std::atomic<bool> sendThreadRunning_{false};
-
-    // SPSC ring buffer (audio thread producer, send thread consumer)
-    std::vector<float> fifo_;
-    size_t fifoMask_{0}; // capacity must be power of two; mask = capacity-1
-    std::atomic<uint64_t> fifoWrite_{0};
-    std::atomic<uint64_t> fifoRead_{0};
-    std::atomic<uint32_t> fifoOverflows_{0};
-
-    // Elastic buffer control
-    float lastSample_{0.0f};        // last sample used for underflow fill
 
     // Continuous ASRC (best quality): PI-controlled resampling ratio + polyphase windowed-sinc
     static constexpr uint32_t kSincPhases = 1024;  // phase table resolution
     static constexpr uint32_t kSincTaps = 64;      // filter taps (must be even)
     std::vector<float> sincTable_;                 // [kSincPhases * kSincTaps]
 
-    // ASRC ring buffer (separate from FIFO to support fractional delay taps)
-    std::vector<float> asrcRing_;
-    size_t asrcMask_{0};
-    uint64_t asrcWrite_{0};        // absolute write index into ring
-    uint64_t asrcRead_{0};         // absolute integer read index into ring (floor position)
-    double asrcFrac_{0.0};         // fractional phase [0,1)
-    std::vector<float> asrcTmp_;   // scratch buffer to avoid per-tick heap allocations
-
-    // PI controller state (controls ratio = input_samples_per_output_sample)
-    double ratio_{1.0};
-    double ratioSmoothed_{1.0};
-    double ratioIntegral_{0.0};
-
-    // Monitoring stats for UI
-    mutable std::mutex sendStatsMutex_;
-    struct SendStats {
-        std::chrono::steady_clock::time_point startTime{std::chrono::steady_clock::now()};
-        uint32_t fifoCapacity{0};
-        uint32_t fifoLevel{0};      // total buffered frames (fifo + asrc)
-        uint32_t fifoOnly{0};       // fifo-only frames
-        uint32_t asrcOnly{0};       // asrc-ring buffered frames
-        uint32_t targetLevel{0};
-        uint64_t sentPackets{0};
-        uint64_t sentFrames{0};
-        uint32_t underflows{0};     // sender underflows (ASRC did not have enough data; conceal with last sample)
-        uint32_t ptpNotCalibratedSkips{0}; // times we skipped sending because PTP wasn't calibrated during warmup
-        uint32_t deadlineMisses{0}; // times sender thread woke up late by > threshold
-        uint32_t overflows{0};      // number of times producer overflowed fifo
-        int32_t lastError{0};       // fifoLevel - targetLevel (samples)
-        double ratioPpm{0.0};       // current resample ratio in ppm (ratio-1)*1e6
-        double ratioPpmMin{0.0};
-        double ratioPpmMax{0.0};
-    } sendStats_;
     
-    // NMOS port
-    uint16_t nmosPort_{0};
-
     // NMOS status (updated from maintenance thread, read from UI thread)
     mutable std::mutex nmosMutex_;
     rav::nmos::Node::Configuration nmosConfigSnapshot_{};
@@ -323,17 +410,16 @@ private:
     void startSendThread();
     void stopSendThread();
     void sendThreadMain();
-    uint32_t fifoLevel() const;
-    uint32_t fifoCapacity() const { return static_cast<uint32_t>(fifo_.size()); }
-    uint32_t fifoWriteSamples(const float* data, uint32_t n);
-    uint32_t fifoReadSamples(float* dst, uint32_t n);
 
     void buildSincTable();
-    void asrcReset();
-    uint32_t asrcFillFromFifo(uint32_t desiredBufferedFrames, uint32_t maxFramesPerCall);
-    float asrcGetSample(uint64_t idx) const;
-    float asrcResampleOne(double ratio);
-    uint32_t asrcBufferedFrames() const;
+    void resetPipeline(SenderInstance::Pipeline& p);
+    uint32_t fifoLevel(const SenderInstance::Pipeline& p) const;
+    uint32_t fifoWriteSamples(SenderInstance::Pipeline& p, const float* data, uint32_t n);
+    uint32_t fifoReadSamples(SenderInstance::Pipeline& p, float* dst, uint32_t n);
+    uint32_t asrcBufferedFrames(const SenderInstance::Pipeline& p) const;
+    uint32_t asrcFillFromFifo(SenderInstance::Pipeline& p, uint32_t desiredBufferedFrames, uint32_t maxFramesPerCall);
+    float asrcGetSample(const SenderInstance::Pipeline& p, uint64_t idx) const;
+    float asrcResampleOne(SenderInstance::Pipeline& p, double ratio);
     
     // Helper methods
     boost::asio::ip::address_v4 generateMulticastAddress(size_t senderIndex);
